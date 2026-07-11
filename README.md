@@ -713,9 +713,1070 @@
 
 ---
 
-### 3주차 : 제3장 인덱스 튜닝
+### 3주차 : 제3장 인덱스 튜닝(2026-07-11)
 #### 제1절 인덱스 기본 원리
 #### 제2절 테이블 액세스 최소화
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - [[SQLP 스터디] 3주차 - 제3장 인덱스 튜닝 1-2 Ⅰ~Ⅸ](https://blog.naver.com/biyoonx/224343603076)
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>클러스터링 팩터, 테이블 랜덤 액세스, 커버링 인덱스 개선 효과 비교</summary>
+  
+  주문 테이블에서 다음 두 가지 SQL이 자주 수행된다.
+
+### SQL-1. 고객 구간별 주문 금액 조회
+
+```sql
+SELECT SUM(O.PAY_AMT)
+FROM   TB_ORDER O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+```
+
+### SQL-2. 일자별 결제 주문 금액 조회
+
+```sql
+SELECT SUM(O.PAY_AMT)
+FROM   TB_ORDER O
+WHERE  O.ORD_DT BETWEEN DATE '2025-01-01' AND DATE '2025-01-10'
+AND    O.ORD_STAT_CD = 'PAY';
+```
+
+현재 인덱스는 다음과 같다.
+
+```text
+X01 : CUST_ID + ORD_DT
+X02 : ORD_DT + ORD_STAT_CD
+```
+
+SQL-1의 성능 개선을 위해 다음 인덱스를 추가하였다.
+
+```text
+X03 : CUST_ID + ORD_DT + ORD_STAT_CD
+```
+
+그러나 SQL-1의 성능은 기대만큼 개선되지 않았다.
+
+이후 같은 데이터를 `CUST_ID, ORD_DT` 순서로 재구성한 테이블을 만들어 비교하였다.
+마지막으로 SQL-1 전용 커버링 인덱스를 추가하였다.
+
+```text
+X04 : CUST_ID + ORD_DT + ORD_STAT_CD + PAY_AMT
+```
+
+---
+
+### 문제 1. 랜덤 액세스가 줄지 않은 원인 분석
+
+`X03(CUST_ID, ORD_DT, ORD_STAT_CD)` 인덱스를 추가했음에도 SQL-1의 성능 개선 효과가 크지 않은 이유를 설명하시오.
+
+단, 다음 관점에서 설명하시오.
+
+```text
+- INDEX RANGE SCAN 이후 TABLE ACCESS BY INDEX ROWID가 계속 발생하는 이유
+- PAY_AMT 조회를 위해 테이블 액세스가 필요한 이유
+- 클러스터링 팩터가 나쁠 때 Buffers가 크게 발생하는 이유
+```
+
+---
+
+### 문제 2. 서로 다른 인덱스의 클러스터링 팩터 비교
+
+`X01(CUST_ID, ORD_DT)`과 `X02(ORD_DT, ORD_STAT_CD)`의 클러스터링 팩터를 비교하시오.
+
+또한 테이블을 `CUST_ID, ORD_DT` 순서로 재구성하면 SQL-1에는 유리할 수 있지만, SQL-2에는 어떤 영향이 있을 수 있는지 설명하시오.
+
+---
+
+### 문제 3. 커버링 인덱스와 클러스터링 팩터 개선 중 선택
+
+SQL-1의 성능 개선 방안으로 다음 두 방법을 비교하시오.
+
+```text
+1. 테이블을 CUST_ID, ORD_DT 순서로 재구성한다.
+2. PAY_AMT까지 포함한 커버링 인덱스 X04를 생성한다.
+```
+
+각 방법의 장단점을 다음 관점에서 설명하시오.
+
+```text
+- TABLE ACCESS BY INDEX ROWID 제거 여부
+- Buffers 감소 효과
+- 인덱스 크기 증가
+- INSERT / UPDATE / DELETE 부하
+- SQL-2 같은 다른 조회 패턴에 미치는 영향
+- 운영 반영 난이도
+```
+
+---
+
+### 전체 실습 SQL
+
+```sql
+/* =========================================================
+   1. 기존 객체 삭제
+   ========================================================= */
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TB_ORDER_GOOD PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TB_ORDER_BAD PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+
+/* =========================================================
+   2. BAD 테이블 생성
+
+   의도:
+   - 실제 적재 순서는 ORD_DT, CUST_ID에 가까움
+   - 따라서 CUST_ID, ORD_DT 인덱스 기준으로는 클러스터링 팩터가 나쁘게 나올 수 있음
+   - 반대로 ORD_DT, ORD_STAT_CD 인덱스 기준으로는 상대적으로 좋게 나올 수 있음
+   ========================================================= */
+
+CREATE TABLE TB_ORDER_BAD
+(
+    ORD_NO       NUMBER        NOT NULL,
+    CUST_ID      NUMBER        NOT NULL,
+    ORD_DT       DATE          NOT NULL,
+    ORD_STAT_CD  VARCHAR2(3)   NOT NULL,
+    PAY_AMT      NUMBER        NOT NULL,
+    DLVY_STAT_CD VARCHAR2(3),
+    FILLER       VARCHAR2(80)
+)
+NOLOGGING;
+
+
+/* =========================================================
+   3-A. 기본 버전 데이터 생성: 30만 건
+
+   기본 실습만 할 경우 여기까지만 데이터 적재하고,
+   아래 3-B 추가 데이터 구간은 실행하지 않는다.
+   ========================================================= */
+
+INSERT /*+ APPEND */ INTO TB_ORDER_BAD
+SELECT
+    LEVEL AS ORD_NO,
+    MOD(LEVEL - 1, 10000) + 1 AS CUST_ID,
+    DATE '2025-01-01' + TRUNC((LEVEL - 1) / 10000) AS ORD_DT,
+    CASE
+        WHEN MOD(LEVEL, 10) = 0 THEN 'CAN'
+        ELSE 'PAY'
+    END AS ORD_STAT_CD,
+    MOD(LEVEL, 100000) + 1000 AS PAY_AMT,
+    CASE
+        WHEN MOD(LEVEL, 3) = 0 THEN 'DLV'
+        WHEN MOD(LEVEL, 3) = 1 THEN 'RDY'
+        ELSE 'ING'
+    END AS DLVY_STAT_CD,
+    RPAD('X', 80, 'X') AS FILLER
+FROM DUAL
+CONNECT BY LEVEL <= 300000;
+
+COMMIT;
+
+
+/* =========================================================
+   3-B. 추가 버전 데이터 생성: 70만 건 추가
+
+   이 구간까지 실행하면 총 100만 건이 된다.
+   기본 30만 건만 실습할 경우 이 구간은 실행하지 않는다.
+   ========================================================= */
+
+INSERT /*+ APPEND */ INTO TB_ORDER_BAD
+SELECT
+    300000 + LEVEL AS ORD_NO,
+    MOD(300000 + LEVEL - 1, 10000) + 1 AS CUST_ID,
+    DATE '2025-01-01' + TRUNC((300000 + LEVEL - 1) / 10000) AS ORD_DT,
+    CASE
+        WHEN MOD(300000 + LEVEL, 10) = 0 THEN 'CAN'
+        ELSE 'PAY'
+    END AS ORD_STAT_CD,
+    MOD(300000 + LEVEL, 100000) + 1000 AS PAY_AMT,
+    CASE
+        WHEN MOD(300000 + LEVEL, 3) = 0 THEN 'DLV'
+        WHEN MOD(300000 + LEVEL, 3) = 1 THEN 'RDY'
+        ELSE 'ING'
+    END AS DLVY_STAT_CD,
+    RPAD('X', 80, 'X') AS FILLER
+FROM DUAL
+CONNECT BY LEVEL <= 700000;
+
+COMMIT;
+
+
+/* =========================================================
+   4. 데이터 확인
+   ========================================================= */
+
+SELECT COUNT(*) AS CNT,
+       MIN(ORD_DT) AS MIN_ORD_DT,
+       MAX(ORD_DT) AS MAX_ORD_DT,
+       MIN(CUST_ID) AS MIN_CUST_ID,
+       MAX(CUST_ID) AS MAX_CUST_ID
+FROM TB_ORDER_BAD;
+
+
+/* =========================================================
+   5. 초기 인덱스 생성
+
+   X01 : SQL-1 고객 기준 조회용
+   X02 : SQL-2 일자 기준 조회용
+   ========================================================= */
+
+CREATE INDEX TB_ORDER_BAD_X01
+ON TB_ORDER_BAD (CUST_ID, ORD_DT)
+NOLOGGING;
+
+CREATE INDEX TB_ORDER_BAD_X02
+ON TB_ORDER_BAD (ORD_DT, ORD_STAT_CD)
+NOLOGGING;
+
+
+/* =========================================================
+   6. 통계 수집
+   ========================================================= */
+
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_ORDER_BAD',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+END;
+/
+
+
+/* =========================================================
+   7. 세그먼트 크기 확인
+   ========================================================= */
+
+SELECT
+    SEGMENT_NAME,
+    SEGMENT_TYPE,
+    ROUND(BYTES / 1024 / 1024, 1) AS MB
+FROM USER_SEGMENTS
+WHERE SEGMENT_NAME LIKE 'TB_ORDER%'
+ORDER BY BYTES DESC;
+
+
+/* =========================================================
+   8. 클러스터링 팩터 확인: BAD 테이블
+   ========================================================= */
+
+SELECT
+    I.TABLE_NAME,
+    I.INDEX_NAME,
+    T.NUM_ROWS,
+    T.BLOCKS,
+    I.LEAF_BLOCKS,
+    I.CLUSTERING_FACTOR,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.BLOCKS, 0), 2) AS CF_PER_BLOCKS,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.NUM_ROWS, 0), 4) AS CF_PER_ROWS
+FROM USER_INDEXES I
+JOIN USER_TABLES T
+  ON T.TABLE_NAME = I.TABLE_NAME
+WHERE I.TABLE_NAME = 'TB_ORDER_BAD'
+ORDER BY I.INDEX_NAME;
+
+
+/* =========================================================
+   9. 실행계획 통계 확인 세션 설정
+   ========================================================= */
+
+ALTER SESSION SET STATISTICS_LEVEL = ALL;
+
+
+/* =========================================================
+   10. SQL-1 실행: BAD + X01
+
+   확인 대상:
+   - INDEX RANGE SCAN
+   - TABLE ACCESS BY INDEX ROWID
+   - TABLE ACCESS 단계의 A-Rows / Buffers
+   - ORD_STAT_CD 조건이 테이블 필터로 처리되는지
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_BAD_X01) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_BAD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   11. SQL-2 실행: BAD + X02
+
+   확인 대상:
+   - X02 기준 클러스터링 팩터와 Buffers
+   - SQL-1과 비교
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_BAD_X02) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_BAD O
+WHERE  O.ORD_DT BETWEEN DATE '2025-01-01' AND DATE '2025-01-10'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   12. X03 추가: SQL-1 조건 컬럼 추가 인덱스
+
+   X03 : CUST_ID + ORD_DT + ORD_STAT_CD
+   ========================================================= */
+
+CREATE INDEX TB_ORDER_BAD_X03
+ON TB_ORDER_BAD (CUST_ID, ORD_DT, ORD_STAT_CD)
+NOLOGGING;
+
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_ORDER_BAD',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+END;
+/
+
+
+/* =========================================================
+   13. 클러스터링 팩터 확인: BAD + X03 추가 후
+   ========================================================= */
+
+SELECT
+    I.TABLE_NAME,
+    I.INDEX_NAME,
+    T.NUM_ROWS,
+    T.BLOCKS,
+    I.LEAF_BLOCKS,
+    I.CLUSTERING_FACTOR,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.BLOCKS, 0), 2) AS CF_PER_BLOCKS,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.NUM_ROWS, 0), 4) AS CF_PER_ROWS
+FROM USER_INDEXES I
+JOIN USER_TABLES T
+  ON T.TABLE_NAME = I.TABLE_NAME
+WHERE I.TABLE_NAME = 'TB_ORDER_BAD'
+ORDER BY I.INDEX_NAME;
+
+
+/* =========================================================
+   14. SQL-1 실행: BAD + X03
+
+   확인 대상:
+   - ORD_STAT_CD를 인덱스에 추가했는데도 TABLE ACCESS BY INDEX ROWID가 남는지
+   - X01 대비 Buffers가 얼마나 줄었는지
+   - 기대만큼 줄지 않는다면 이유는 무엇인지
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_BAD_X03) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_BAD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   15. GOOD 테이블 생성
+
+   같은 데이터를 CUST_ID, ORD_DT 순서로 재구성한다.
+   이 작업은 ORDER BY 정렬 때문에 CPU / TEMP 사용량이 가장 클 수 있다.
+   ========================================================= */
+
+CREATE TABLE TB_ORDER_GOOD
+NOLOGGING
+AS
+SELECT *
+FROM TB_ORDER_BAD
+ORDER BY CUST_ID, ORD_DT;
+
+
+/* =========================================================
+   16. GOOD 테이블 인덱스 생성
+
+   BAD 테이블과 동일한 구조의 인덱스를 만든다.
+   ========================================================= */
+
+CREATE INDEX TB_ORDER_GOOD_X01
+ON TB_ORDER_GOOD (CUST_ID, ORD_DT)
+NOLOGGING;
+
+CREATE INDEX TB_ORDER_GOOD_X02
+ON TB_ORDER_GOOD (ORD_DT, ORD_STAT_CD)
+NOLOGGING;
+
+CREATE INDEX TB_ORDER_GOOD_X03
+ON TB_ORDER_GOOD (CUST_ID, ORD_DT, ORD_STAT_CD)
+NOLOGGING;
+
+
+/* =========================================================
+   17. GOOD 테이블 통계 수집
+   ========================================================= */
+
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_ORDER_GOOD',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+END;
+/
+
+
+/* =========================================================
+   18. BAD / GOOD 클러스터링 팩터 비교
+
+   확인 대상:
+   - GOOD_X01은 BAD_X01보다 클러스터링 팩터가 좋아졌는가?
+   - GOOD_X02는 BAD_X02보다 나빠졌는가?
+   ========================================================= */
+
+SELECT
+    I.TABLE_NAME,
+    I.INDEX_NAME,
+    T.NUM_ROWS,
+    T.BLOCKS,
+    I.LEAF_BLOCKS,
+    I.CLUSTERING_FACTOR,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.BLOCKS, 0), 2) AS CF_PER_BLOCKS,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.NUM_ROWS, 0), 4) AS CF_PER_ROWS
+FROM USER_INDEXES I
+JOIN USER_TABLES T
+  ON T.TABLE_NAME = I.TABLE_NAME
+WHERE I.TABLE_NAME IN ('TB_ORDER_BAD', 'TB_ORDER_GOOD')
+ORDER BY I.INDEX_NAME, I.TABLE_NAME;
+
+
+/* =========================================================
+   19. SQL-1 실행: GOOD + X01
+
+   확인 대상:
+   - BAD + X01 대비 TABLE ACCESS BY INDEX ROWID의 Buffers 변화
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_GOOD_X01) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_GOOD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   20. SQL-1 실행: GOOD + X03
+
+   확인 대상:
+   - BAD + X03 대비 TABLE ACCESS BY INDEX ROWID의 Buffers 변화
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_GOOD_X03) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_GOOD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   21. SQL-2 실행: GOOD + X02
+
+   확인 대상:
+   - BAD + X02 대비 TABLE ACCESS BY INDEX ROWID의 Buffers 변화
+   - CUST_ID, ORD_DT 순서 재구성이 SQL-2에 미친 영향
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_GOOD_X02) NO_BATCH_TABLE_ACCESS_BY_ROWID(O) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_GOOD O
+WHERE  O.ORD_DT BETWEEN DATE '2025-01-01' AND DATE '2025-01-10'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   22. X04 커버링 인덱스 생성
+
+   SQL-1에서 필요한 PAY_AMT까지 인덱스에 포함한다.
+   ========================================================= */
+
+CREATE INDEX TB_ORDER_BAD_X04
+ON TB_ORDER_BAD (CUST_ID, ORD_DT, ORD_STAT_CD, PAY_AMT)
+NOLOGGING;
+
+CREATE INDEX TB_ORDER_GOOD_X04
+ON TB_ORDER_GOOD (CUST_ID, ORD_DT, ORD_STAT_CD, PAY_AMT)
+NOLOGGING;
+
+
+/* =========================================================
+   23. X04 생성 후 통계 수집
+   ========================================================= */
+
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_ORDER_BAD',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_ORDER_GOOD',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+END;
+/
+
+
+/* =========================================================
+   24. SQL-1 실행: BAD + X04
+
+   확인 대상:
+   - TABLE ACCESS BY INDEX ROWID가 제거되는지
+   - BAD 테이블이어도 Buffers가 크게 줄어드는지
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_BAD_X04) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_BAD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   25. SQL-1 실행: GOOD + X04
+
+   확인 대상:
+   - GOOD + X03과 비교
+   - BAD + X04와 비교
+   ========================================================= */
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(O TB_ORDER_GOOD_X04) */
+       SUM(O.PAY_AMT) AS SUM_PAY_AMT
+FROM   TB_ORDER_GOOD O
+WHERE  O.CUST_ID BETWEEN 1001 AND 2000
+AND    O.ORD_DT  BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'
+AND    O.ORD_STAT_CD = 'PAY';
+
+SELECT *
+FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   26. 최종 세그먼트 크기 비교
+
+   확인 대상:
+   - X04가 다른 인덱스보다 얼마나 커졌는지
+   ========================================================= */
+
+SELECT
+    SEGMENT_NAME,
+    SEGMENT_TYPE,
+    ROUND(BYTES / 1024 / 1024, 1) AS MB
+FROM USER_SEGMENTS
+WHERE SEGMENT_NAME LIKE 'TB_ORDER%'
+ORDER BY SEGMENT_NAME;
+
+
+/* =========================================================
+   27. 최종 클러스터링 팩터 비교
+   ========================================================= */
+
+SELECT
+    I.TABLE_NAME,
+    I.INDEX_NAME,
+    T.NUM_ROWS,
+    T.BLOCKS,
+    I.LEAF_BLOCKS,
+    I.CLUSTERING_FACTOR,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.BLOCKS, 0), 2) AS CF_PER_BLOCKS,
+    ROUND(I.CLUSTERING_FACTOR / NULLIF(T.NUM_ROWS, 0), 4) AS CF_PER_ROWS
+FROM USER_INDEXES I
+JOIN USER_TABLES T
+  ON T.TABLE_NAME = I.TABLE_NAME
+WHERE I.TABLE_NAME IN ('TB_ORDER_BAD', 'TB_ORDER_GOOD')
+ORDER BY I.INDEX_NAME, I.TABLE_NAME;
+
+```
+
+**답변**
+
+- [[SQLP 스터디] 3주차 - 제3장 인덱스 튜닝 1-2 Ⅹ.문제풀이](https://blog.naver.com/biyoonx/224343603076)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+<summary>이지은🙋🏻‍♀️</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>Q. 인덱스 추가 후 조회는 빨라졌지만 운영 반영에 실패한 사례 분석</summary>
+  
+  한 의료기관의 `TB_MEDICAL_HISTORY` 테이블에는 최근 5년간 진단 이력 약 1억 2천만 건이 저장되어 있으며 진단이력 조회를 위해 아래와 같은 SQL이 자주 수행된다.
+
+```sql
+SELECT
+       M.HISTORY_NO,
+       M.MEDICAL_DT,
+       M.PATIENT_NO,
+       M.MEDICAL_STAT_CD,
+       M.MEDICAL_AMT,
+       M.DEPT_CD
+FROM   TB_MEDICAL_HISTORY M
+WHERE  M.MEDICAL_DT BETWEEN DATE '2025-06-01' AND DATE '2025-06-30'
+AND    M.MEDICAL_STAT_CD = 'COMPLETE'
+AND    M.PATIENT_NO BETWEEN 1000000 AND 1999999
+ORDER BY M.MEDICAL_DT DESC,
+         M.HISTORY_NO DESC;
+```
+
+현재 인덱스는 다음과 같다.
+
+```sql
+X01 : MEDICAL_DT
+X02 : PATIENT_NO + MEDICAL_DT
+```
+
+운영 중 평균 응답시간은 약 18초였다.
+
+#### 1차 튜닝
+
+```sql
+X03 : MEDICAL_DT + MEDICAL_STAT_CD --18초 → 16.8초
+```
+
+**실행계획 일부**
+
+```
+INDEX RANGE SCAN X03
+A-Rows 1,800,000
+Buffers 45,000
+
+TABLE ACCESS BY INDEX ROWID TB_MEDICAL_HISTORY
+A-Rows 1,650,000
+Buffers 2,100,000
+
+SORT ORDER BY
+A-Rows 120,000
+Buffers 2,180,000
+```
+
+#### 2차 튜닝
+
+DBA는 PATIENT_NO 조건까지 인덱스에 포함하면 성능이 좋아질 것이라고 판단하여 다음 인덱스를 생성하였다.
+
+```sql
+X04 : MEDICAL_DT + MEDICAL_STAT_CD + PATIENT_NO --16.8초 → 15.9초
+```
+
+**실행계획 일부**
+
+```
+INDEX RANGE SCAN X04
+A-Rows 1,800,000
+Buffers 58,000
+
+TABLE ACCESS BY INDEX ROWID TB_MEDICAL_HISTORY
+A-Rows 120,000
+Buffers 1,450,000
+
+SORT ORDER BY
+A-Rows 120,000
+Buffers 1,510,000
+```
+
+#### 3차 튜닝
+
+다른 DBA는 인덱스 컬럼 순서가 잘못되었다고 판단하여 다음 인덱스를 생성하였다.
+
+```sql
+X05 : PATIENT_NO + MEDICAL_DT + MEDICAL_STAT_CD --15.9초 → 7.5초
+```
+
+**실행계획 일부**
+
+```
+INDEX RANGE SCAN X05
+A-Rows 130,000
+Buffers 35,000
+
+TABLE ACCESS BY INDEX ROWID TB_MEDICAL_HISTORY
+A-Rows 120,000
+Buffers 720,000
+
+SORT ORDER BY
+A-Rows 120,000
+Buffers 760,000
+```
+
+#### 4차 튜닝
+
+마지막으로 다음 인덱스를 생성하였다.
+
+```sql
+X06 : PATIENT_NO + MEDICAL_DT + MEDICAL_STAT_CD + HISTORY_NO + MEDICAL_AMT + DEPT_CD --7.5초 → 1.2초
+```
+
+**실행계획 일부**
+
+```
+INDEX RANGE SCAN X06
+A-Rows 120,000
+Buffers 95,000
+
+SORT ORDER BY
+A-Rows 120,000
+Buffers 120,000
+```
+
+그러나 X06 적용 후 다음 문제가 발생하였다.
+
+- 진단 등록 배치 지연
+- 진단정보 수정(Update) 처리시간 증가
+- 인덱스 세그먼트 크기 급증
+- Buffer Cache 사용량 증가
+- 일부 다른 진단 조회 SQL의 실행계획 변경
+
+결국 운영팀은 X06을 삭제하고 X05까지만 운영에 반영하였다.
+
+1. X03 인덱스의 성능 개선 효과가 작았던 이유를 설명하시오.
+2. X04에서 `PATIENT_NO`를 추가했음에도 성능 개선 효과가 제한적이었던 이유를 설명하시오.
+3. X05가 X04보다 더 개선된 이유를 설명하시오.
+4. X06에서 응답시간이 크게 개선된 이유를 설명하시오.
+5. X06이 조회 성능은 가장 좋았지만 운영에서 삭제된 이유를 설명하시오.
+6. 운영팀이 X06 대신 X05까지만 반영한 판단이 타당한지 평가하고, 최종적으로 이 사례에서 배울 수 있는 인덱스 튜닝 원칙을 서술하시오.
+
+**답변**
+
+- [https://app.notion.com/p/leeeden/3-39670b7b39f480f69e7ac81416cd31d4?source=copy_link](https://app.notion.com/p/leeeden/3-39670b7b39f480f69e7ac81416cd31d4?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>인덱스 설계와 손익분기점 문제</summary>
+  
+  쇼핑몰 상품 리뷰 테이블 TB_REVIEW가 있다. 현재 인덱스는 PK(REVIEW_NO)만 존재한다.
+
+### 데이터 특성
+
+```
+전체 리뷰 건수         : 200만 건
+PRD_ID(상품) distinct  : 5,000개, 상품당 평균 리뷰 약 400건
+REVIEW_STAT_CD         : 'NOR'(정상) 98%, 'BLK'(차단) 2%
+예외 상품 1개 (P00001) : 이벤트로 리뷰가 폭증, 6만 건 (전체의 3%, 다른 상품 평균의 150배)
+```
+
+### SQL-1. 상품 상세 화면 - 특정 상품의 정상 리뷰 평점 평균 (초당 수십 회 실행)
+```sql
+SELECT AVG(L.RATING)
+FROM   TB_REVIEW L
+WHERE  L.PRD_ID          = :prd_id
+AND    L.REVIEW_STAT_CD  = 'NOR';
+```
+
+### SQL-2. 관리자 화면 - 상품별 전체 리뷰 건수 (상태 무관, 수시 조회)
+```sql
+SELECT COUNT(*)
+FROM   TB_REVIEW L
+WHERE  L.PRD_ID = :prd_id;
+```
+
+---
+
+### 문제 1. 두 SQL을 지원하는 결합인덱스 컬럼 순서 설계
+
+위 데이터 특성을 참고하여 SQL-1, SQL-2를 함께 지원할 결합인덱스를 설계하시오.
+
+```
+- 컬럼 구성을 (PRD_ID + REVIEW_STAT_CD)로 할지, (REVIEW_STAT_CD + PRD_ID)로 할지
+  근거를 들어 정하시오.
+```
+
+### 문제 2. 실행계획 판독
+
+문제 1에서 설계한 인덱스를 직접 생성하고, 평범한 상품(PRD_ID='P02500', 리뷰 약 400건)에 대해 SQL-1을 실행하여 실행계획을 확인하시오. (아래 실습 SQL의 STEP 3 참고)
+
+```
+- 나온 실행계획이 정상적인 Index Range Scan인지 Predicate Information을 근거로
+  판단하시오.
+- TABLE ACCESS 관련 오퍼레이션이 실행계획에 나타나는 이유를 설명하고, 이 단계를
+  생략하려면 인덱스를 어떻게 바꾸면 되는지 설명하시오. (커버링 인덱스 개념 활용)
+- Buffers 값이 크게 나오는지 작게 나오는지 확인하고, 그 이유를 인덱스 구조
+  (수직적 탐색 + 수평적 탐색) 관점에서 설명하시오.
+```
+
+### 문제 3. 손익분기점 계산
+
+동일한 인덱스로 이벤트 상품(PRD_ID='P00001', 정상 리뷰 약 58,800건)에 대해 SQL-1을 실행해보고(아래 실습 SQL의 STEP 4 참고), 문제 2의 결과와 비교하시오.
+
+```
+- 두 경우의 Buffers 차이를 직접 비교하시오.
+- 인덱스 손익분기점이 무엇인지 설명하고, 왜 이런 차이가 생기는지 TABLE FULL SCAN
+  (Sequential Access, Multiblock I/O)과 인덱스 ROWID를 이용한 TABLE ACCESS
+  (Random Access, Single Block I/O)의 차이를 근거로 설명하시오.
+- 읽어야 할 행이 전체 테이블의 몇 % 정도를 넘어서면 일반적으로 Full Scan이
+  유리해지는지, 이번 실습 결과를 근거로 대략적인 감을 잡아보시오.
+- 이런 상품이 섞여 있을 때 SQL 전체(모든 상품 조회)를 하나의 인덱스 전략으로만
+  최적화하기 어려운 이유를 설명하시오.
+```
+
+---
+
+### 전체 실습 SQL
+
+```sql
+/* =========================================================
+   STEP 0. 기존 객체 삭제
+   ========================================================= */
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TB_REVIEW PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+
+/* =========================================================
+   STEP 1. 테이블 생성
+   ========================================================= */
+
+CREATE TABLE TB_REVIEW
+(
+    REVIEW_NO       NUMBER         NOT NULL,
+    PRD_ID          VARCHAR2(6)    NOT NULL,
+    MBR_NO          VARCHAR2(8)    NOT NULL,
+    RATING          NUMBER(1)      NOT NULL,
+    REVIEW_STAT_CD  VARCHAR2(3)    NOT NULL,
+    REG_DT          DATE           NOT NULL,
+    REVIEW_TXT      VARCHAR2(200)
+)
+NOLOGGING;
+
+
+/* =========================================================
+   STEP 1-A. 이벤트 상품(P00001) 데이터 생성: 6만 건
+   ========================================================= */
+
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    LEVEL AS REVIEW_NO,
+    'P00001' AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL - 1, 50000) + 1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5) + 1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || LEVEL AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 60000;
+
+COMMIT;
+
+
+/* =========================================================
+   STEP 1-B. 나머지 4,999개 상품 데이터 생성: 194만 건
+   ========================================================= */
+
+-- 1번째 (1 ~ 500,000)
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    60000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL - 1, 4999) + 2), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL - 1, 50000) + 1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5) + 1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (60000 + LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+-- 2번째 (500,001 ~ 1,000,000)
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    560000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL - 1, 4999) + 2), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL - 1, 50000) + 1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5) + 1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (560000 + LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+-- 3번째 (1,000,001 ~ 1,500,000)
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    1060000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL - 1, 4999) + 2), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL - 1, 50000) + 1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5) + 1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (1060000 + LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+-- 4번째 (1,500,001 ~ 1,940,000)
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    1560000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL - 1, 4999) + 2), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL - 1, 50000) + 1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5) + 1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (1560000 + LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 440000;
+COMMIT;
+
+
+/* =========================================================
+   STEP 2. 데이터 및 상품별 분포 확인
+   ========================================================= */
+
+SELECT COUNT(*) AS CNT,
+       COUNT(DISTINCT PRD_ID) AS CNT_PRD_ID
+FROM TB_REVIEW;
+
+SELECT PRD_ID, COUNT(*) AS CNT,
+       ROUND(COUNT(*) / (SELECT COUNT(*) FROM TB_REVIEW) * 100, 2) AS PCT
+FROM TB_REVIEW
+WHERE PRD_ID IN ('P00001', 'P02500')
+GROUP BY PRD_ID
+ORDER BY CNT DESC;
+
+
+/* =========================================================
+   STEP 3. (직접 작성) 문제 1에서 설계한 인덱스를 만들고,
+            SQL-1을 P02500 상품으로 실행하여 실행계획을 확인해보시오.
+
+   힌트:
+   - CREATE INDEX ...
+   - DBMS_STATS.GATHER_TABLE_STATS(...)
+   - ALTER SESSION SET STATISTICS_LEVEL = ALL;
+   - SELECT /*+ GATHER_PLAN_STATISTICS */ ... (원하면 INDEX 힌트로 강제해도 됨)
+   - SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+     'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+ ========================================================= */
+
+ALTER SESSION SET STATISTICS_LEVEL = ALL;
+
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(L.RATING)
+FROM   TB_REVIEW L
+WHERE  L.PRD_ID         = 'P02500'
+AND    L.REVIEW_STAT_CD = 'NOR';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+
+/* =========================================================
+   STEP 4. (직접 작성) 같은 인덱스로 P00001 상품에 대해 SQL-1을 실행해보고,
+            STEP 3 결과와 Buffers를 비교해보시오.
+
+   추가로 시도해볼 것:
+   - 힌트 없이 실행했을 때 옵티마이저가 어떤 방식을 선택하는지
+   - INDEX 힌트로 강제했을 때와 FULL 힌트로 강제했을 때 Buffers가 어떻게 다른지
+   ========================================================= */
+-- 힌트 없이 실행 (옵티마이저 선택)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(L.RATING)
+FROM   TB_REVIEW L
+WHERE  L.PRD_ID         = 'P00001'
+AND    L.REVIEW_STAT_CD = 'NOR';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 인덱스 강제
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(L TB_REVIEW_X01) */
+       AVG(L.RATING)
+FROM   TB_REVIEW L
+WHERE  L.PRD_ID         = 'P00001'
+AND    L.REVIEW_STAT_CD = 'NOR';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+```
+
+**답변**
+
+- [https://app.notion.com/p/SQLP-3-1-398894b3ff32802391e0c9e8a85be556?source=copy_link](https://app.notion.com/p/SQLP-3-1-398894b3ff32802391e0c9e8a85be556?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
 
 ---
 
