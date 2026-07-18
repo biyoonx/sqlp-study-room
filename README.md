@@ -1780,9 +1780,1196 @@ SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
 
 ---
 
-### 4주차 : 제3장 인덱스 튜닝
+### 4주차 : 제3장 인덱스 튜닝(2026-07-18)
 #### 제3절 인덱스 스캔 효율화
 #### 제4절 인덱스 설계
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - [[SQLP 스터디] 4주차 - 제3장 인덱스 튜닝 3-4 Ⅰ~Ⅸ](https://blog.naver.com/biyoonx/224350422640)
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>대형 블로그 플랫폼 인덱스 설계</summary>
+  
+  ### 문제 상황
+
+국내 대형 블로그 플랫폼을 운영하고 있다.
+
+서비스 이용자가 증가하면서 게시글과 댓글 데이터가 급격히 증가하였고, 최근 다음과 같은 문제가 발생하였다.
+
+일부 목록 조회 SQL의 응답 시간이 지속적으로 증가하고 있다.
+관리자 조회는 데이터가 증가할수록 성능 저하가 심해지고 있다.
+유사한 인덱스가 계속 추가되면서 게시글과 댓글의 `INSERT` 및 `UPDATE` 성능이 저하되고 있다.
+운영팀에서는 실제 업무에 필요한 인덱스만 유지하도록 인덱스 구조를 재설계해 달라고 요청하였다.
+
+DBA는 업무 SQL의 수행 특성과 데이터 분포를 분석하여, 인덱스 튜닝과 저장 구조 개선을 포함한 전체적인 인덱스 재설계를 요청하였다.
+
+### 1. 데이터 특성
+
+#### BLOG_POST
+- 전체 게시글 수: 200,000,000건
+- 하루 평균 게시글 등록 수: 400,000건
+- 데이터는 대부분 `CREATED_AT` 순서로 입력된다.
+- 공개글(`PUBLIC`): 전체의 95%
+- 비공개 글(`PRIVATE`): 전체의 5%
+- 공지글(`NOTICE_YN = 'Y'`): 전체의 0.1%
+- 일반 블로그에는 수백 건의 게시글이 존재한다.
+- 일부 유명 블로그에는 수백만 건의 게시글이 존재한다.
+- 일반 작성자는 수십∼수백 건의 게시글을 작성한다.
+- 일부 운영 계정과 전문 작성자는 수백만 건의 게시글을 작성한다.
+
+#### BLOG_COMMENT
+- 전체 댓글 수: 1,500,000,000건
+- 하루 평균 댓글 등록 수: 8,000,000건
+- 댓글은 `POST_ID`별로 매우 편중되어 있다.
+- 일반 게시글의 댓글 수: 평균 10건
+- 인기 게시글의 댓글 수: 최대 수백만 건
+- 정상 댓글(`NORMAL`): 전체의 98%
+- 삭제 댓글(`DELETED`): 전체의 2%
+- 댓글 데이터도 대체로 `CREATED_AT` 순서로 입력되며, 동일 게시글의 댓글이 테이블 내에 연속해서 저장되지는 않는다.
+
+### 2. 현재 테이블 구조
+
+#### BLOG_POST
+
+```sql
+CREATE TABLE BLOG_POST
+(
+    POST_ID         NUMBER          NOT NULL,
+    BLOG_ID         NUMBER          NOT NULL,
+    AUTHOR_ID       NUMBER          NOT NULL,
+    CATEGORY_ID     NUMBER,
+    STATUS_CD       VARCHAR2(10)    NOT NULL,
+    NOTICE_YN       CHAR(1)         DEFAULT 'N' NOT NULL,
+    CREATED_AT      DATE            NOT NULL,
+    UPDATED_AT      DATE            NOT NULL,
+    VIEW_CNT        NUMBER          DEFAULT 0 NOT NULL,
+    TITLE           VARCHAR2(300)   NOT NULL,
+    CONTENT         CLOB,
+    CONSTRAINT BLOG_POST_PK
+        PRIMARY KEY (POST_ID)
+);
+```
+
+#### BLOG_COMMENT
+
+```sql
+CREATE TABLE BLOG_COMMENT
+(
+    COMMENT_ID      NUMBER          NOT NULL,
+    POST_ID         NUMBER          NOT NULL,
+    AUTHOR_ID       NUMBER          NOT NULL,
+    STATUS_CD       VARCHAR2(10)    NOT NULL,
+    CREATED_AT      DATE            NOT NULL,
+    UPDATED_AT      DATE            NOT NULL,
+    CONTENT         VARCHAR2(1000)  NOT NULL,
+    CONSTRAINT BLOG_COMMENT_PK
+        PRIMARY KEY (COMMENT_ID)
+);
+```
+
+### 3. 현재 운영 중인 인덱스
+
+기본키 인덱스를 제외하고 다음 보조 인덱스가 운영 중이다.
+
+#### BLOG_POST 인덱스
+
+```sql
+CREATE INDEX BLOG_POST_X01
+    ON BLOG_POST
+       (BLOG_ID, CREATED_AT DESC);
+
+CREATE INDEX BLOG_POST_X02
+    ON BLOG_POST
+       (BLOG_ID, STATUS_CD, CREATED_AT DESC);
+
+CREATE INDEX BLOG_POST_X03
+    ON BLOG_POST
+       (BLOG_ID, CATEGORY_ID, CREATED_AT DESC);
+
+CREATE INDEX BLOG_POST_X04
+    ON BLOG_POST
+       (BLOG_ID, CATEGORY_ID, STATUS_CD, CREATED_AT DESC);
+
+CREATE INDEX BLOG_POST_X05
+    ON BLOG_POST
+       (AUTHOR_ID, CREATED_AT DESC);
+
+CREATE INDEX BLOG_POST_X06
+    ON BLOG_POST
+       (CREATED_AT);
+
+CREATE INDEX BLOG_POST_X07
+    ON BLOG_POST
+       (STATUS_CD, CREATED_AT);
+```
+
+#### BLOG_COMMENT 인덱스
+
+```sql
+CREATE INDEX BLOG_COMMENT_X01
+    ON BLOG_COMMENT
+       (POST_ID, CREATED_AT DESC);
+
+CREATE INDEX BLOG_COMMENT_X02
+    ON BLOG_COMMENT
+       (POST_ID, STATUS_CD, CREATED_AT DESC);
+
+CREATE INDEX BLOG_COMMENT_X03
+    ON BLOG_COMMENT
+       (STATUS_CD, POST_ID, CREATED_AT DESC);
+
+CREATE INDEX BLOG_COMMENT_X04
+    ON BLOG_COMMENT
+       (AUTHOR_ID, CREATED_AT DESC);
+```
+
+현재 운영 중인 보조 인덱스는 총 11개이다.
+
+운영팀은 다음과 같은 문제를 제기하였다.
+
+- `BLOG_POST_X01`과 `BLOG_POST_X02`는 선두 컬럼과 주요 용도가 유사하다.
+- `BLOG_POST_X03`과 `BLOG_POST_X04`도 카테고리 목록 조회를 위해 유사하게 구성되어 있다.
+- `BLOG_POST_X06`과 `BLOG_POST_X07`은 관리자 조회 외에는 거의 사용되지 않는다.
+- `STATUS_CD`는 게시글과 댓글 모두 특정 값에 데이터가 편중되어 있다.
+- 댓글 인덱스 역시 동일한 업무 SQL을 지원하기 위한 유사 인덱스가 중복되어 있다.
+- 인덱스 추가 이후 게시글과 댓글 등록 처리 시간이 증가하였다.
+
+### 4. 업무 SQL
+
+#### SQL-1. 블로그 메인 최신 게시글 조회
+
+특정 블로그의 공개 게시글 중 기준 시각보다 이전에 작성된 최신 게시글 20건을 조회한다.
+
+```sql
+SELECT POST_ID, BLOG_ID, AUTHOR_ID, CATEGORY_ID, NOTICE_YN, CREATED_AT, TITLE, VIEW_CNT
+FROM BLOG_POST
+WHERE BLOG_ID = :BLOG_ID
+	AND STATUS_CD = 'PUBLIC'
+	AND CREATED_AT < :LAST_DT
+ORDER BY CREATED_AT DESC
+FETCH FIRST 20 ROWS ONLY;
+```
+
+##### 업무 특성
+
+- 초당 약 15,000회 수행
+- 블로그 메인 화면의 핵심 SQL
+- 첫 20건을 조회한 후 더 이상 데이터를 읽을 필요가 없다.
+- 공개 게시글은 전체 게시글의 95%이다.
+- `CONTENT`는 목록 화면에서 조회하지 않는다.
+
+#### SQL-2. 카테고리별 최신 게시글 조회
+
+특정 블로그의 특정 카테고리에 속한 공개 게시글 중 최신 게시글 20건을 조회한다.
+
+```sql
+SELECT POST_ID, BLOG_ID, AUTHOR_ID, CATEGORY_ID, CREATED_AT, TITLE, VIEW_CNT
+FROM BLOG_POST
+WHERE BLOG_ID = :BLOG_ID
+	AND CATEGORY_ID = :CATEGORY_ID
+	AND STATUS_CD = 'PUBLIC'
+	AND CREATED_AT < :LAST_DT
+ORDER BY CREATED_AT DESC
+FETCH FIRST 20 ROWS ONLY;
+```
+
+##### 업무 특성
+
+- 초당 약 3,000회 수행
+- 하나의 블로그에는 평균 20개의 카테고리가 존재한다.
+- 일부 블로그에는 500개 이상의 카테고리가 존재한다.
+- 카테고리별 게시글 수의 편차가 크다.
+- 첫 20건을 조회한 후 더 이상 데이터를 읽을 필요가 없다.
+
+#### SQL-3. 게시글 상세 조회
+
+게시글 번호를 이용해 게시글 상세 정보를 조회한다.
+
+```sql
+SELECT POST_ID, BLOG_ID, AUTHOR_ID, CATEGORY_ID, STATUS_CD, NOTICE_YN, CREATED_AT, UPDATED_AT, VIEW_CNT, TITLE, CONTENT
+FROM BLOG_POST
+WHERE POST_ID = :POST_ID;
+```
+
+##### 업무 특성
+
+- 초당 약 8,000회 수행
+- 항상 한 건 이하를 조회한다.
+- `CONTENT` CLOB 컬럼을 포함한 게시글 전체 정보를 조회한다.
+- `POST_ID`는 기본키이다.
+
+#### SQL-4. 게시글별 최신 댓글 조회
+
+특정 게시글의 정상 댓글 중 최신 댓글 50건을 조회한다.
+
+```sql
+SELECT COMMENT_ID, POST_ID, AUTHOR_ID, STATUS_CD, CREATED_AT, CONTENT
+FROM BLOG_COMMENT
+WHERE POST_ID = :POST_ID
+	AND STATUS_CD = 'NORMAL'
+	AND CREATED_AT < :LAST_DT
+ORDER BY CREATED_AT DESC
+FETCH FIRST 50 ROWS ONLY;
+```
+
+##### 업무 특성
+
+- 초당 약 10,000회 수행
+- 첫 50건을 조회한 후 더 이상 데이터를 읽을 필요가 없다.
+- 정상 댓글은 전체 댓글의 98%이다.
+- 일반 게시글에는 평균 10건의 댓글이 존재한다.
+- 인기 게시글에는 수백만 건의 댓글이 존재한다.
+- `CONTENT` 컬럼을 반드시 조회해야 한다.
+- 동일 게시글의 댓글이 Heap 테이블 내에 연속적으로 저장되어 있지는 않다.
+
+#### SQL-5. 작성자별 게시글 이력 조회
+
+특정 작성자가 일정 기간 작성한 게시글 전체를 조회한다.
+
+```sql
+SELECT POST_ID, BLOG_ID, CATEGORY_ID, STATUS_CD, CREATED_AT, TITLE, VIEW_CNT
+FROM BLOG_POST
+WHERE AUTHOR_ID = :AUTHOR_ID
+	AND CREATED_AT >= :FROM_DT
+	AND CREATED_AT < :TO_DT
+ORDER BY CREATED_AT DESC;
+```
+
+##### 업무 특성
+
+- 분당 약 100회 수행
+- 조회된 게시글 전체를 반환한다.
+- 일반 작성자의 결과 건수는 수십∼수백 건이다.
+- 일부 운영 계정과 전문 작성자는 조회 기간에 따라 수백만 건이 반환될 수 있다.
+- 결과 건수 제한이 없으므로 부분범위 처리 효과를 기대하기 어렵다.
+
+#### SQL-6. 관리자 기간별 게시글 추출
+
+관리자가 일정 기간에 등록된 모든 게시글을 추출한다.
+
+```sql
+SELECT POST_ID, BLOG_ID, AUTHOR_ID, CATEGORY_ID, STATUS_CD, NOTICE_YN, CREATED_AT, UPDATED_AT, VIEW_CNT, TITLE, CONTENT
+FROM BLOG_POST
+WHERE CREATED_AT >= :FROM_DT
+	AND CREATED_AT < :TO_DT;
+```
+##### 업무 특성
+
+- 하루 1회 이하로 수행
+- 1일, 7일, 30일 또는 90일 범위를 조회한다.
+- 조건에 해당하는 모든 게시글을 반환한다.
+- `CONTENT` CLOB 컬럼을 포함한 전체 데이터를 추출한다.
+- 부분범위 처리가 불가능하다.
+- 테이블 데이터는 대부분 `CREATED_AT` 순서로 적재되어 있다.
+
+### 5. 운영 제약
+
+- SQL 문장은 변경할 수 없다.
+- 테이블의 물리 저장 구조는 변경할 수 있다.
+- 기본키 인덱스를 제외하고 두 테이블에 유지할 수 있는 보조 인덱스는 합계 최대 4개이다.
+- IOT를 선택하는 경우 IOT 기본키는 보조 인덱스 개수에서 제외한다.
+- 기존 보조 인덱스는 필요에 따라 유지, 제거, 통합 또는 컬럼 순서 변경이 가능하다.
+- 게시글 및 댓글의 `INSERT` 성능 저하가 심하므로 인덱스 개수와 인덱스 크기를 최소화해야 한다.
+- SQL-1과 SQL-4는 핵심 온라인 SQL로서 성능 저하를 허용하기 어렵다.
+- 관리자 조회인 SQL-6은 하루 한 번 이하로 수행되며, 일정 수준의 Full Table Scan은 허용할 수 있다.
+- 특정 SQL 하나에 최적인 인덱스를 모두 생성하기보다 전체 업무 성능과 DML 부하를 종합적으로 고려해야 한다.
+
+### 6. 검토 대상
+
+다음 저장 구조를 비교·검토한다.
+
+- Heap Table
+- Index Organized Table(IOT)
+- Index Cluster
+- Hash Cluster
+
+필요한 경우 다음 인덱스 접근 방식과 설계 요소도 함께 검토한다.
+
+- Composite Index
+- Covering Index
+- Index Range Scan
+- Index Range Scan Descending
+- Index Skip Scan
+- Index Full Scan
+- Index Fast Full Scan
+- Table Full Scan
+- 부분범위 처리
+- 인덱스 클러스터링 팩터
+- 인덱스 손익분기점
+
+### 7. 요구사항
+
+#### 문제 1. SQL별 인덱스 접근 방식 분석
+
+SQL-1부터 SQL-6까지 각 SQL에 대해 현재 인덱스를 사용했을 때 예상할 수 있는 Access Path를 설명하시오.
+
+필요한 경우 다음 항목을 포함한다.
+
+- Index Range Scan
+- Index Range Scan Descending
+- Table Access By Index Rowid
+- Index Unique Scan
+- Table Full Scan
+- 정렬 연산 발생 여부
+
+#### 문제 2. Access Predicate와 Filter Predicate 분석
+
+현재 인덱스 및 새롭게 설계할 인덱스를 기준으로 각 SQL 조건을 다음과 같이 구분하시오.
+
+- Index Access Predicate
+- Index Filter Predicate
+- Table Filter Predicate
+
+범위 조건 뒤에 위치한 인덱스 컬럼이 스캔 범위에 미치는 영향도 함께 설명하시오.
+
+#### 문제 3. 부분범위 처리 및 정렬 생략
+
+SQL-1, SQL-2, SQL-4에서 다음 사항을 분석하시오.
+
+- 부분범위 처리가 가능한가?
+- 인덱스를 이용해 `ORDER BY` 정렬을 생략할 수 있는가?
+- 결과 건수는 적더라도 많은 인덱스 엔트리를 읽을 가능성이 있는가?
+- 조건절 컬럼과 정렬 컬럼의 순서가 부분범위 처리에 어떤 영향을 미치는가?
+
+#### 문제 4. 인덱스 스캔 효율을 고려한 컬럼 순서 설계
+
+각 SQL에 가장 적합한 복합 인덱스의 컬럼 구성과 순서를 설계하시오.
+
+다음 사항을 종합적으로 고려한다.
+
+- SQL 수행 빈도
+- 컬럼 선택도
+- 동등 조건과 범위 조건
+- 인덱스 스캔 시작점과 종료점
+- 정렬 생략
+- 부분범위 처리
+- 특정 값에 편중된 `STATUS_CD`
+- 일반 사용자와 대량 데이터 보유 사용자의 차이
+
+#### 문제 5. 커버링 인덱스 적용 가능성
+
+SQL-1, SQL-2, SQL-4, SQL-5에 커버링 인덱스를 적용할 수 있는지 검토하시오.
+
+다음 사항을 함께 설명한다.
+
+- 테이블 랜덤 액세스 감소 효과
+- `TITLE`, `CONTENT`, `VIEW_CNT`를 인덱스에 포함할 때의 영향
+- 인덱스 크기 증가
+- 리프 블록 수와 인덱스 높이 증가 가능성
+- `INSERT` 및 `UPDATE` 부하
+- 수행 빈도를 고려한 커버링 인덱스의 실익
+
+#### 문제 6. 클러스터링 팩터와 Heap Table 검토
+
+다음 사항을 설명하시오.
+
+- `CREATED_AT` 인덱스와 `BLOG_ID`, `AUTHOR_ID`, `POST_ID` 선두 인덱스의 클러스터링 팩터가 서로 다를 것으로 예상되는 이유
+- 클러스터링 팩터가 테이블 랜덤 액세스와 손익분기점에 미치는 영향
+- 현재 Heap Table을 유지하는 것이 적절한지
+- 테이블을 특정 인덱스 순서로 재구성할 경우 다른 SQL에 미치는 영향
+
+#### 문제 7. `BLOG_COMMENT` 저장 구조 설계
+
+BLOG_COMMENT 테이블을 다음 중 어떤 구조로 설계하는 것이 적절한지 판단하시오.
+
+- Heap Table
+- IOT
+- Index Cluster
+- Hash Cluster
+
+다음 사항을 종합적으로 고려한다.
+
+- `POST_ID`별 최신 댓글 50건 조회
+- 인기 게시글의 댓글 편중
+- 댓글 `INSERT` 빈도
+- `COMMENT_ID`를 이용한 단건 조회·수정 가능성
+- `CONTENT` 컬럼의 크기
+- IOT Overflow 사용 가능성
+- 보조 인덱스 추가 필요성
+- 게시글과 댓글을 `POST_ID`로 클러스터링할 때의 장단점
+
+#### 문제 8. 관리자 조회의 인덱스 손익분기점
+
+SQL-6의 수행 결과가 다음과 같다고 가정한다.
+
+| 조회 기간 | Index Range Scan | Full Table Scan |
+| ----- | ---------------: | --------------: |
+| 1일    |               4초 |             48초 |
+| 7일    |              21초 |             48초 |
+| 30일   |              66초 |             48초 |
+| 90일   |             181초 |             48초 |
+
+다음 사항을 설명하시오.
+
+- 현재 환경에서 인덱스 손익분기점이 존재하는 구간
+- 조회 기간이 증가할수록 Index Range Scan의 수행 시간이 급격히 증가하는 이유
+- `CREATED_AT` 인덱스의 클러스터링 팩터가 양호하더라도 Full Table Scan보다 느려질 수 있는 이유
+- SQL-6을 위해 `BLOG_POST_X06` 또는 `BLOG_POST_X07`을 유지해야 하는지 여부
+- SQL 수행 빈도와 전체 DML 부하를 고려한 최종 판단
+
+#### 문제 9. 최종 인덱스 및 저장 구조 재설계
+
+DBA는 현재 인덱스 구성이 비효율적이라고 판단하였다.
+
+문제 1부터 문제 8까지 분석한 내용을 바탕으로 `BLOG_POST`와 `BLOG_COMMENT`의 저장 구조 및 인덱스를 재설계하시오.
+
+다음 내용을 모두 제시한다.
+
+- 각 테이블의 최종 저장 구조
+- 유지할 기존 인덱스
+- 제거할 기존 인덱스
+- 통합하거나 컬럼 순서를 변경할 인덱스
+- 새롭게 생성할 인덱스
+- 인덱스를 생성하지 않는 SQL과 그 처리 방식
+- 최종 보조 인덱스 4개의 구성과 컬럼 순서
+- 각 인덱스가 지원하는 업무 SQL
+- 최종 설계가 조회 성능과 `INSERT`·`UPDATE` 성능에 미치는 영향
+
+기본키를 위한 인덱스는 보조 인덱스 개수에서 제외한다.
+
+두 테이블에 유지할 수 있는 보조 인덱스는 합계 최대 4개이다.
+
+IOT를 선택할 경우 IOT 기본키는 보조 인덱스 개수에서 제외한다.
+
+**답변**
+
+- [[SQLP 스터디] 4주차 - 제3장 인덱스 튜닝 3-4 Ⅹ.문제풀이](https://blog.naver.com/biyoonx/224350422640)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+<summary>이지은🙋🏻‍♀️(답변 추가 예정)</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>Q. 의료기관 월별 백업 배치의 인덱스 스캔 효율화 및 인덱스 설계</summary>
+  
+  한 의료정보 시스템에서는 매월 의료기관 마스터 정보를 백업 테이블에 적재한다.
+
+원본 테이블 `TB_HPROVIDER`에는 약 7,000건의 의료기관 정보가 저장되어 있다.
+
+백업 테이블 `TB_HPROVIDER_BKUP`에는 최근 5년간의 월별 백업 데이터 약 40만 건이 누적되어 있다.
+
+배치 프로그램은 같은 연도와 월에 동일한 의료기관이 중복 적재되지 않도록 기존 백업 데이터의 존재 여부를 확인한 후 신규 데이터만 입력한다.
+
+### 주요 테이블
+
+`TB_HPROVIDER`
+
+<img width="846" height="484" alt="Image" src="https://github.com/user-attachments/assets/cf99615b-95be-4b1d-9e2e-fc19af7a5271" />
+
+`TB_HPROVIDER_BKUP`
+
+<img width="1105" height="484" alt="Image" src="https://github.com/user-attachments/assets/fdfd5244-d92b-4da1-a2a0-655a6d0038e2" />
+
+### 현재 인덱스
+
+<img width="968" height="129" alt="Image" src="https://github.com/user-attachments/assets/2098bf8c-ff4a-4c9a-b040-0112aeb74447" />
+
+### 기존 SQL
+
+```sql
+INSERT INTO dbo.tb_hprovider_bkup
+            (c_mdins_id,
+             c_bkup_yr,
+             c_bkup_mm,
+             c_mdins_oid,
+             c_mdins_nm,
+             c_mdins_cls_cd,
+             c_use_yn)
+SELECT H.c_mdins_id,
+       Year(@STARTDATE),
+       Month(@STARTDATE),
+       H.c_mdins_oid,
+       H.c_mdins_nm,
+       H.c_mdins_cls_cd,
+       H.c_use_yn
+FROM   dbo.tb_hprovider H
+WHERE  H.c_reg_dtm < @ENDDATE
+       AND ( CONVERT(NVARCHAR, H.c_mdins_id) + '-'
+             + CONVERT(NVARCHAR, Year(@STARTDATE)) + '-'
+             + CONVERT(NVARCHAR, Month(@STARTDATE)) + '-'
+             + H.c_mdins_oid ) NOT IN (SELECT
+           CONVERT(NVARCHAR, B.c_mdins_id) + '-'
+           + CONVERT(NVARCHAR, B.c_bkup_yr) + '-'
+           + CONVERT(NVARCHAR, B.c_bkup_mm) + '-'
+           + B.c_mdins_oid
+FROM   dbo.tb_hprovider_bkup B); 
+```
+
+### 기존 실행계획 주요 형태
+
+<img width="2048" height="683" alt="Image" src="https://github.com/user-attachments/assets/b2322c37-9f65-42b1-b27c-a1dba9328b4b" />
+
+주요 특징은 다음과 같다.
+
+- 백업 테이블 예상 스캔 건수: 약 40만 건
+- INSERT 예상 대상 건수: 약 7천 건
+- 백업 테이블 중복 확인: 2회
+- 비클러스터드 인덱스 수: 5개
+
+### 개선 SQL
+
+```sql
+DECLARE @BKUP_YR INT = Year(@STARTDATE);
+DECLARE @BKUP_MM INT = Month(@STARTDATE);
+
+INSERT INTO dbo.tb_hprovider_bkup
+            (c_mdins_id,
+             c_bkup_yr,
+             c_bkup_mm,
+             c_mdins_oid,
+             c_mdins_nm,
+             c_mdins_cls_cd,
+             c_use_yn)
+SELECT H.c_mdins_id,
+       @BKUP_YR,
+       @BKUP_MM,
+       H.c_mdins_oid,
+       H.c_mdins_nm,
+       H.c_mdins_cls_cd,
+       H.c_use_yn
+FROM   dbo.tb_hprovider H
+WHERE  H.c_reg_dtm < @ENDDATE
+       AND H.c_mdins_oid IS NOT NULL
+       AND NOT EXISTS (SELECT 1
+                       FROM   dbo.tb_hprovider_bkup B
+                       WHERE  B.c_mdins_id = H.c_mdins_id
+                              AND B.c_bkup_yr = @BKUP_YR
+                              AND B.c_bkup_mm = @BKUP_MM
+                              AND B.c_mdins_oid = H.c_mdins_oid); 
+```
+
+### 개선 실행계획
+
+<img width="1887" height="475" alt="Image" src="https://github.com/user-attachments/assets/3b952536-3e91-42f9-936e-827a36f91610" />
+
+---
+
+#### 문제 1. 인덱스가 있는데도 Scan이 발생한 이유
+
+백업 테이블에 다음 클러스터드 인덱스가 존재한다.
+
+```
+(C_MDINS_ID, C_BKUP_YR, C_BKUP_MM, C_MDINS_OID)
+```
+
+그럼에도 기존 SQL에서 `Index Scan`이 발생한 이유를 인덱스 스캔 효율화 관점에서 설명하시오.
+
+---
+
+#### 문제 2. 기존 SQL의 개선
+
+기존 SQL의 중복 확인 조건을 개선하여 작성하시오.
+
+또한 변경된 SQL이 기존 SQL보다 효율적인 이유를 다음 관점에서 설명하시오.
+
+- 인덱스 액세스 방식
+- 스캔량
+- CPU 연산
+- 중복 확인 방식
+
+---
+
+#### 문제 3. 실행계획 기반 인덱스 선택 분석
+
+개선 SQL의 실행계획에서는 다음과 같이 `TB_HPROVIDER_BKUP`에 대해 `IDX_HPROVIDER_BKUP_PERIOD_OID`를 이용한 Index Seek가 수행되었다.
+
+다음 사항을 설명하시오.
+
+1. 옵티마이저가 해당 인덱스를 선택한 이유를 설명하시오.
+2. 실행계획에서 `Merge Join (Left Anti Semi Join)`이 선택된 이유를 설명하시오.
+3. WHERE 절의 조건 작성 순서가 실행계획에 영향을 주는지 설명하시오.
+
+---
+
+#### 문제 4. 신규 인덱스 추가 여부
+
+개선 SQL의 성능을 더 높이기 위해 다음 인덱스를 추가하려고 한다.
+
+```sql
+CREATE UNIQUE NONCLUSTERED INDEX UX_TB_HPROVIDER_BKUP_01
+ON dbo.TB_HPROVIDER_BKUP
+(
+      C_BKUP_YR
+    , C_BKUP_MM
+    , C_MDINS_ID
+    , C_MDINS_OID
+);
+```
+
+현재 인덱스 구성에서 위 인덱스를 추가하는 것이 적절한지 판단하고 그 이유를 설명하시오.
+
+---
+
+#### 문제 5. 중복 인덱스 분석
+
+다음 두 인덱스의 중복 가능성을 분석하시오.
+
+```sql
+IDX_C_REG_MDINS_OID
+(
+    C_MDINS_OID
+)
+IDX_HPROVIDER_BKUP_OID
+(
+    C_MDINS_OID
+)
+INCLUDE
+(
+    C_MDINS_NM
+)
+```
+
+둘 중 하나를 제거할 수 있는 조건과 제거 전에 확인해야 할 사항을 설명하시오.
+
+---
+
+#### 문제 6. 유사한 결합 인덱스 비교
+
+다음 두 인덱스를 비교하시오.
+
+```sql
+IDX_HPROVIDER_BKUP_PERIOD_OID
+(
+      C_BKUP_YR
+    , C_BKUP_MM
+    , C_MDINS_OID
+)
+INCLUDE
+(
+      C_MDINS_CLS_CD
+    , C_MDINS_NM
+)
+IDX_HPROVIDER_BKUP_YR_MDINS_OID
+(
+      C_BKUP_YR
+    , C_MDINS_OID
+)
+INCLUDE
+(
+      C_BKUP_MM
+    , C_MDINS_CLS_CD
+    , C_MDINS_NM
+)
+```
+
+두 인덱스가 완전히 동일한 용도로 사용할 수 없는 이유를 설명하고, 각각에 적합한 검색 조건을 제시하시오.
+
+---
+
+#### 문제 7. INSERT와 인덱스 유지 비용
+
+개선 후 백업 테이블 조회가 `Index Scan`에서 `Clustered Index Seek`로 변경되었지만 실행계획에는 여전히 다음 연산자가 나타난다.
+
+- Sort
+- Table Spool
+- Index Insert
+
+중복 확인 성능이 개선되었음에도 위 연산자가 남아 있는 이유를 설명하시오.
+
+또한 비클러스터드 인덱스 개수가 INSERT 성능에 미치는 영향을 설명하시오.
+
+---
+
+#### 문제 8. Access Predicate와 Filter Predicate
+
+다음 인덱스가 존재한다고 가정한다.
+
+```sql
+(C_BKUP_YR, C_BKUP_MM, C_MDINS_OID)
+```
+
+아래 조건을 수행할 때 인덱스의 액세스 조건과 필터 조건을 구분하여 설명하시오.
+
+```sql
+WHERE c_bkup_yr = 2026
+AND c_bkup_mm BETWEEN 1 AND 6
+AND c_mdins_oid = '1.2.410.100110.10.10000001'
+```
+
+또한 다음 인덱스 순서로 변경할 경우의 차이를 설명하시오.
+
+```
+(C_BKUP_YR, C_MDINS_OID, C_BKUP_MM)
+```
+
+---
+
+#### 문제 9. 현재 인덱스 재설계
+
+현재 백업 테이블에 다음 인덱스가 존재한다.
+
+```
+PK_TB_HPROVIDER_BKUP
+IDX_C_REG_MDINS_OID
+IDX_HPROVIDER_BKUP_OID
+IDX_HPROVIDER_BKUP_PERIOD_OID
+IDX_HPROVIDER_BKUP_YR_MDINS_OID
+IDX_HPROVIDER_BKUP_YYYYMM_OID
+```
+
+다음 조회 유형이 주로 수행된다고 가정한다.
+
+- 의료기관 ID와 백업 연월, OID를 이용한 중복 확인
+- 특정 연월의 의료기관 목록 조회
+- OID를 이용한 의료기관명 조회
+- 연도와 OID를 이용한 월별 이력 조회
+- 사용 여부별 연도 의료기관 조회
+
+현재 인덱스 중 유지할 인덱스, 통합 또는 제거를 검토할 인덱스를 구분하고 인덱스 재설계 시 고려해야 할 원칙을 설명하시오.
+
+**답변**
+
+- 추가 예정
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>상품 리뷰 평점 조회 - 인덱스 스캔 효율화 및 설계 문제</summary>
+  
+  쇼핑몰 상품 리뷰 테이블 TB_REVIEW가 있다. 현재 아래와 같이 인덱스가 구성되어 있다.
+
+### 현재 인덱스 구성
+
+```sql
+CREATE UNIQUE INDEX TB_REVIEW_PK  ON TB_REVIEW (REVIEW_NO);
+CREATE INDEX TB_REVIEW_X01 ON TB_REVIEW (PRD_ID, REVIEW_STAT_CD);
+CREATE INDEX TB_REVIEW_X02 ON TB_REVIEW (PRD_ID);
+CREATE INDEX TB_REVIEW_X03 ON TB_REVIEW (REVIEW_STAT_CD, PRD_ID);
+CREATE INDEX TB_REVIEW_X04 ON TB_REVIEW (PRD_ID, REVIEW_STAT_CD, RATING);
+```
+
+### 데이터 특성
+
+```
+전체 리뷰 건수         : 200만 건
+PRD_ID(상품) distinct : 5,000개 (P00001 ~ P05000)
+REVIEW_STAT_CD        : 'NOR'(정상) 98%, 'BLK'(차단) 2%
+RATING                : 1 ~ 5
+```
+
+### SQL-1. 특정 상품 범위의 정상 리뷰 평점 평균 (초당 수십 회 실행)
+
+```sql
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID BETWEEN 'P00100' AND 'P00199';
+```
+
+### SQL-2. 특정 상품의 상태별 리뷰 평점 평균 (초당 수십 회 실행)
+
+```sql
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = :stat_cd;
+```
+
+### SQL-3. 특정 상태의 전체 리뷰 평점 평균
+
+```sql
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  REVIEW_STAT_CD = :stat_cd;
+```
+
+---
+
+### 문제 1. 중복 인덱스 식별
+
+현재 인덱스 X01 ~ X04 중 SQL-1, SQL-2, SQL-3을 기준으로
+제거 가능한 인덱스와 반드시 유지해야 할 인덱스를 각각 선정하고 그 이유를 아래 관점에서 서술하시오.
+
+1. DML 부하
+2. 스캔 효율
+3. 유지보수 비용
+
+---
+
+### 문제 2. BETWEEN → IN-LIST 전환
+
+SQL-1을 실행했을 때 아래 두 실행계획을 비교하고 물음에 답하시오.
+
+```
+[변경 전 실행계획]
+| Id | Operation                     | Name          |
+|  0 | SELECT STATEMENT              |               |
+|  1 |  SORT AGGREGATE               |               |
+|  2 |   TABLE ACCESS BY INDEX ROWID | TB_REVIEW     |
+|* 3 |    INDEX RANGE SCAN           | TB_REVIEW_X01 |
+
+Predicate Information:
+  3 - access("PRD_ID" >= 'P00100' AND "PRD_ID" <= 'P00199')
+      filter("REVIEW_STAT_CD" = 'NOR')
+
+[변경 후 실행계획]
+| Id | Operation                     | Name          |
+|  0 | SELECT STATEMENT              |               |
+|  1 |  SORT AGGREGATE               |               |
+|  2 |   TABLE ACCESS BY INDEX ROWID | TB_REVIEW     |
+|  3 |    INLIST ITERATOR            |               |
+|* 4 |     INDEX RANGE SCAN          | TB_REVIEW_X01 |
+
+Predicate Information:
+  4 - access("PRD_ID" = 'P00100' AND "REVIEW_STAT_CD" = 'NOR')
+      access("PRD_ID" = 'P00101' AND "REVIEW_STAT_CD" = 'NOR')
+      ...
+```
+
+1. 변경 전 실행계획에서 `REVIEW_STAT_CD`가 `filter`로 처리되는 이유를 인덱스 스캔 범위 관점에서 설명하시오.
+2. 변경 후 실행계획에서 `REVIEW_STAT_CD`가 `access`로 바뀐 이유를 IN-LIST Iterator 동작 방식과 연관지어 설명하시오.
+3. IN 조건은 등치(=) 조건인지 IN-List Iterator 동작 방식을 근거로 설명하시오.
+
+---
+
+### 문제 3. BETWEEN vs LIKE
+
+SQL-1의 PRD_ID 조건을 아래와 같이 변경했을 때
+발생하는 문제를 설명하시오.
+
+```sql
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID LIKE 'P001%';
+```
+
+1. 스캔 범위 관점에서 BETWEEN과 LIKE의 차이
+2. `PRD_ID` 포맷이 고정 길이가 아닌 경우 어떤 문제가 발생하는지 설명하고 BETWEEN과의 스캔 범위 차이를 설명하시오.
+3. 둘 중 권장하는 방법과 이유
+
+---
+
+### 문제 4. 옵션 조건 처리 방식 비교
+
+SQL-2에서 `:stat_cd`가 옵션 조건일 때 아래 세 가지 방식으로 처리할 수 있다.
+각각의 장단점을 아래 관점에 따라 비교하시오.
+
+```sql
+-- 방식 1. OR 조건
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND   (REVIEW_STAT_CD = :stat_cd OR :stat_cd IS NULL);
+
+-- 방식 2. NVL
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = NVL(:stat_cd, REVIEW_STAT_CD);
+
+-- 방식 3. UNION ALL
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    :stat_cd IS NULL
+UNION ALL
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = :stat_cd
+AND    :stat_cd IS NOT NULL;
+```
+
+1. 인덱스 액세스 조건 사용 가능 여부
+2. NULL 허용 컬럼일 때 결과 누락 여부
+
+---
+
+### 실습 SQL
+```SQL
+/* =========================================
+   STEP 0. 기존 객체 삭제
+   ========================================= */
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE TB_REVIEW PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+/* =========================================
+   STEP 1. 테이블 생성
+   ========================================= */
+CREATE TABLE TB_REVIEW
+(
+    REVIEW_NO       NUMBER         NOT NULL,
+    PRD_ID          VARCHAR2(6)    NOT NULL,
+    MBR_NO          VARCHAR2(8)    NOT NULL,
+    RATING          NUMBER(1)      NOT NULL,
+    REVIEW_STAT_CD  VARCHAR2(3)    NOT NULL,
+    REG_DT          DATE           NOT NULL,
+    REVIEW_TXT      VARCHAR2(200)
+) NOLOGGING;
+
+/* =========================================
+   STEP 2. 데이터 생성 (총 200만 건)
+   ========================================= */
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL-1, 5000)+1), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL-1, 50000)+1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5)+1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || LEVEL AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    500000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL-1, 5000)+1), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL-1, 50000)+1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5)+1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (500000+LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    1000000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL-1, 5000)+1), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL-1, 50000)+1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5)+1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (1000000+LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+INSERT /*+ APPEND */ INTO TB_REVIEW
+SELECT
+    1500000 + LEVEL AS REVIEW_NO,
+    'P' || LPAD(TO_CHAR(MOD(LEVEL-1, 5000)+1), 5, '0') AS PRD_ID,
+    LPAD(TO_CHAR(MOD(LEVEL-1, 50000)+1), 8, '0') AS MBR_NO,
+    MOD(LEVEL, 5)+1 AS RATING,
+    CASE WHEN MOD(LEVEL, 50) = 0 THEN 'BLK' ELSE 'NOR' END AS REVIEW_STAT_CD,
+    DATE '2025-01-01' + MOD(LEVEL, 180) AS REG_DT,
+    'review text ' || (1500000+LEVEL) AS REVIEW_TXT
+FROM DUAL
+CONNECT BY LEVEL <= 500000;
+COMMIT;
+
+/* =========================================
+   STEP 3. 인덱스 생성
+   ========================================= */
+CREATE UNIQUE INDEX TB_REVIEW_PK
+    ON TB_REVIEW (REVIEW_NO);
+CREATE INDEX TB_REVIEW_X01
+    ON TB_REVIEW (PRD_ID, REVIEW_STAT_CD) NOLOGGING;
+CREATE INDEX TB_REVIEW_X02
+    ON TB_REVIEW (PRD_ID) NOLOGGING;
+CREATE INDEX TB_REVIEW_X03
+    ON TB_REVIEW (REVIEW_STAT_CD, PRD_ID) NOLOGGING;
+CREATE INDEX TB_REVIEW_X04
+    ON TB_REVIEW (PRD_ID, REVIEW_STAT_CD, RATING) NOLOGGING;
+
+/* =========================================
+   STEP 4. 통계 수집
+   ========================================= */
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(
+        OWNNAME    => USER,
+        TABNAME    => 'TB_REVIEW',
+        CASCADE    => TRUE,
+        METHOD_OPT => 'FOR ALL COLUMNS SIZE 1'
+    );
+END;
+/
+
+/* =========================================
+   STEP 5. 데이터 분포 확인
+   ========================================= */
+SELECT COUNT(*) AS TOTAL_CNT
+FROM   TB_REVIEW;
+
+SELECT REVIEW_STAT_CD,
+       COUNT(*) AS CNT,
+       ROUND(COUNT(*) / (SELECT COUNT(*) FROM TB_REVIEW) * 100, 2) AS PCT
+FROM   TB_REVIEW
+GROUP BY REVIEW_STAT_CD;
+
+SELECT COUNT(DISTINCT PRD_ID) AS PRD_CNT
+FROM   TB_REVIEW;
+
+/* =========================================
+   STEP 6. 문제 2 - BETWEEN vs IN-LIST
+   ========================================= */
+ALTER SESSION SET STATISTICS_LEVEL = ALL;
+
+-- [변경 전] BETWEEN
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(T TB_REVIEW_X01) */
+       AVG(RATING)
+FROM   TB_REVIEW T
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID BETWEEN 'P00100' AND 'P00199';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- [변경 후] IN-LIST
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(T TB_REVIEW_X01) */
+       AVG(RATING)
+FROM   TB_REVIEW T
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID IN (
+    'P00100','P00101','P00102','P00103','P00104',
+    'P00105','P00106','P00107','P00108','P00109',
+    'P00110','P00111','P00112','P00113','P00114',
+    'P00115','P00116','P00117','P00118','P00119',
+    'P00120','P00130','P00140','P00150','P00199'
+);
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+/* =========================================
+   STEP 7. 문제 3 - BETWEEN vs LIKE
+   ========================================= */
+
+-- LIKE 사용
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(T TB_REVIEW_X01) */
+       AVG(RATING)
+FROM   TB_REVIEW T
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID LIKE 'P001%';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- BETWEEN 사용
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(T TB_REVIEW_X01) */
+       AVG(RATING)
+FROM   TB_REVIEW T
+WHERE  REVIEW_STAT_CD = 'NOR'
+AND    PRD_ID BETWEEN 'P00100' AND 'P00199';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 실제 조회 범위 확인
+SELECT COUNT(DISTINCT PRD_ID) AS LIKE_CNT
+FROM   TB_REVIEW
+WHERE  PRD_ID LIKE 'P001%';
+
+SELECT COUNT(DISTINCT PRD_ID) AS BETWEEN_CNT
+FROM   TB_REVIEW
+WHERE  PRD_ID BETWEEN 'P00100' AND 'P00199';
+
+/* =========================================
+   STEP 8. 문제 4 - 옵션 조건 처리 방식 비교
+   ========================================= */
+
+-- 방식 1. OR 조건 (:stat_cd = 'NOR' 입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND   (REVIEW_STAT_CD = 'NOR' OR 'NOR' IS NULL);
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 방식 1. OR 조건 (:stat_cd = NULL 미입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND   (REVIEW_STAT_CD = NULL OR NULL IS NULL);
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 방식 2. NVL (:stat_cd = 'NOR' 입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = NVL('NOR', REVIEW_STAT_CD);
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 방식 2. NVL (:stat_cd = NULL 미입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = NVL(NULL, REVIEW_STAT_CD);
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 방식 3. UNION ALL (:stat_cd = 'NOR' 입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    'NOR' IS NULL
+UNION ALL
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = 'NOR'
+AND    'NOR' IS NOT NULL;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+
+-- 방식 3. UNION ALL (:stat_cd = NULL 미입력 시)
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    NULL IS NULL
+UNION ALL
+SELECT AVG(RATING)
+FROM   TB_REVIEW
+WHERE  PRD_ID = 'P00100'
+AND    REVIEW_STAT_CD = NULL
+AND    NULL IS NOT NULL;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
+'ALLSTATS LAST +PREDICATE +ALIAS +NOTE'));
+```
+
+**답변**
+
+- [[SQLP] 제3장(2) 문제 및 풀이](https://app.notion.com/p/SQLP-3-2-3a0894b3ff328055ba85e7e252d390c6?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
 
 ---
 
