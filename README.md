@@ -2246,7 +2246,7 @@ IOT를 선택할 경우 IOT 기본키는 보조 인덱스 개수에서 제외한
 </details>
 
 <details>
-<summary>이지은🙋🏻‍♀️(답변 추가 예정)</summary>
+<summary>이지은🙋🏻‍♀️</summary>
 
 - [x] 주제에 대한 서술형 문제 및 풀이 공유
 
@@ -2532,7 +2532,7 @@ IDX_HPROVIDER_BKUP_YYYYMM_OID
 
 **답변**
 
-- 추가 예정
+- [https://app.notion.com/p/leeeden/4-39d70b7b39f480a29223c34052e204ff?source=copy_link](https://app.notion.com/p/leeeden/4-39d70b7b39f480a29223c34052e204ff?source=copy_link)
 </details>
 </dd>
 </dl>
