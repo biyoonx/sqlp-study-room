@@ -2973,12 +2973,686 @@ SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
 
 ---
 
-### 5주차 : 제4장 조인 튜닝
+### 5주차 : 제4장 조인 튜닝(2026-07-26)
 #### 제1절 NL 조인
 #### 제2절 소트 머지 조인
 #### 제3절 해시 조인
 #### 제4절 스칼라 서브쿼리
 #### 제5절 고급 조인 기법
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - [[SQLP 스터디] 5주차 - 제4장 조인 튜닝 Ⅰ~Ⅸ](https://m.blog.naver.com/biyoonx/224357799010)
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>판매 당시 상품가격 조회 및 정산</summary>
+  
+  ### 문제 상황
+
+### 1. 테이블 및 데이터 특성
+
+#### `SALE_TXN`
+
+```sql
+CREATE TABLE SALE_TXN
+(
+    SALE_ID       NUMBER        NOT NULL,
+    CUSTOMER_ID   NUMBER        NOT NULL,
+    PRODUCT_ID    NUMBER        NOT NULL,
+    SALE_DTM      DATE          NOT NULL,
+    SALE_QTY      NUMBER        NOT NULL,
+    SALE_AMT      NUMBER        NOT NULL,
+    STATUS_CD     VARCHAR2(2)   NOT NULL,
+    CONSTRAINT SALE_TXN_PK PRIMARY KEY (SALE_ID)
+);
+```
+
+- 전체 3억 건
+- 일평균 50만 건
+- 한 달 조회 시 약 1,500만 건
+- 고객 1명의 최근 3개월 판매 건수는 평균 30건
+- `STATUS_CD = '01'`인 정상 판매가 전체의 95%
+
+#### `PRODUCT`
+
+```sql
+CREATE TABLE PRODUCT
+(
+    PRODUCT_ID    NUMBER        NOT NULL,
+    CATEGORY_ID   NUMBER        NOT NULL,
+    PRODUCT_NM    VARCHAR2(200) NOT NULL,
+    USE_YN        CHAR(1)       NOT NULL,
+    CONSTRAINT PRODUCT_PK PRIMARY KEY (PRODUCT_ID)
+);
+```
+
+- 전체 50만 건
+- 대부분 사용 중
+- 모든 `SALE_TXN.PRODUCT_ID`에 대응하는 `PRODUCT` 행이 존재함
+
+#### `PRODUCT_PRICE_HIST`
+
+```sql
+CREATE TABLE PRODUCT_PRICE_HIST
+(
+    PRODUCT_ID    NUMBER       NOT NULL,
+    VALID_FROM    DATE         NOT NULL,
+    VALID_TO      DATE         NOT NULL,
+    SALE_PRICE    NUMBER       NOT NULL,
+    CONSTRAINT PRODUCT_PRICE_HIST_PK
+        PRIMARY KEY (PRODUCT_ID, VALID_FROM)
+);
+```
+
+- 전체 1,500만 건
+- 상품당 평균 30개의 가격이력
+- 유효기간은 `[VALID_FROM, VALID_TO)` 형식
+- 동일 상품의 이력 구간은 중복되지 않음
+- 가격이력은 판매 시점 전체에 대해 빠짐없이 존재함
+
+```sql
+CREATE INDEX SALE_TXN_X01
+    ON SALE_TXN (CUSTOMER_ID, SALE_DTM DESC, SALE_ID DESC);
+
+CREATE INDEX SALE_TXN_X02
+    ON SALE_TXN (SALE_DTM);
+```
+
+---
+
+### 문제 1. 소량 조회와 NL 조인
+
+#### 업무 요구사항
+
+특정 고객의 최근 정상 판매 20건에 대해 상품명과 판매 당시 적용 가격을 조회한다.
+
+- 기존 SQL
+
+```sql
+SELECT SALE_ID,
+       SALE_DTM,
+       PRODUCT_ID,
+       PRODUCT_NM,
+       SALE_QTY,
+       SALE_PRICE
+FROM (
+    SELECT S.SALE_ID,
+           S.SALE_DTM,
+           S.PRODUCT_ID,
+           P.PRODUCT_NM,
+           S.SALE_QTY,
+           H.SALE_PRICE,
+           ROW_NUMBER() OVER (
+               ORDER BY S.SALE_DTM DESC, S.SALE_ID DESC
+           ) AS RN
+    FROM SALE_TXN S
+         JOIN PRODUCT P
+           ON P.PRODUCT_ID = S.PRODUCT_ID
+         JOIN PRODUCT_PRICE_HIST H
+           ON H.PRODUCT_ID = S.PRODUCT_ID
+          AND S.SALE_DTM >= H.VALID_FROM
+          AND S.SALE_DTM <  H.VALID_TO
+    WHERE S.CUSTOMER_ID = :CUSTOMER_ID
+      AND S.STATUS_CD = '01'
+      AND S.SALE_DTM >= ADD_MONTHS(SYSDATE, -3)
+)
+WHERE RN <= 20
+ORDER BY SALE_DTM DESC, SALE_ID DESC;
+```
+
+- 출제 질문
+1. 이 SQL에서 가장 적합한 조인 방식과 조인 순서를 설명하시오.
+2. 상품 및 가격이력 조인 전에 판매 20건을 먼저 확정하도록 SQL을 개선하시오.
+3. `PRODUCT_PRICE_HIST_PK(PRODUCT_ID, VALID_FROM)`가 선분이력 검색에 어떻게 사용되는지 설명하시오.
+4. 상위 20건을 먼저 추출해도 결과가 동일하기 위한 전제조건을 설명하시오.
+
+---
+
+### 문제 2. 대량 집계와 해시 조인
+
+#### 업무 요구사항
+
+한 달 동안 발생한 정상 판매를 상품 카테고리별로 집계한다.
+
+- 기존 SQL
+
+```sql
+SELECT P.CATEGORY_ID,
+       COUNT(*) AS SALE_CNT,
+       SUM(S.SALE_QTY) AS SALE_QTY,
+       SUM(S.SALE_AMT) AS SALE_AMT
+FROM SALE_TXN S
+     JOIN PRODUCT P
+       ON P.PRODUCT_ID = S.PRODUCT_ID
+WHERE S.SALE_DTM >= :FROM_DT
+  AND S.SALE_DTM <  :TO_DT
+  AND S.STATUS_CD = '01'
+GROUP BY P.CATEGORY_ID;
+```
+
+- 기존 실행 특성
+	- SALE_TXN 조건 결과: 1,400만 건
+	- PRODUCT PK 탐색 Starts: 1,400만 회
+	- PRODUCT 테이블 랜덤 액세스: 약 1,400만 회
+	- 최종 결과: 카테고리 120건
+
+- 출제 질문
+1. 현재 NL 조인이 비효율적인 이유를 실행통계에 근거하여 설명하시오.
+2. 적절한 조인 방식과 Build Input을 설명하시오.
+3. `SALE_TXN_X02(SALE_DTM)`를 이용한 Index Range Scan과 Full Table Scan의 비용을 비교할 때 확인해야 할 요소를 설명하고, 현재 정보만으로 어느 방식이 유리하다고 단정할 수 있는지 논하시오.
+
+---
+
+### 문제 3. 선분이력과 소트 머지 조인
+
+#### 업무 요구사항
+
+최근 1년간 전체 판매에 대해 판매 당시 적용된 상품가격을 연결하여 정산자료를 생성한다.
+
+- SQL
+
+```sql
+SELECT S.SALE_ID,
+       S.PRODUCT_ID,
+       S.SALE_DTM,
+       S.SALE_QTY,
+       H.SALE_PRICE,
+       S.SALE_QTY * H.SALE_PRICE AS CALC_AMT
+FROM SALE_TXN S
+     JOIN PRODUCT_PRICE_HIST H
+       ON H.PRODUCT_ID = S.PRODUCT_ID
+      AND S.SALE_DTM >= H.VALID_FROM
+      AND S.SALE_DTM <  H.VALID_TO
+WHERE S.SALE_DTM >= :FROM_DT
+  AND S.SALE_DTM <  :TO_DT
+  AND S.STATUS_CD = '01';
+```
+
+- 기존 실행통계 예시
+
+```text
+------------------------------------------------------------------------------------------------
+| Id | Operation              | Starts | E-Rows | A-Rows | Buffers  |
+------------------------------------------------------------------------------------------------
+|  0 | SELECT STATEMENT       |      1 |        |  170M  | 9,500,000|
+|* 1 |  HASH JOIN             |      1 |   180M |  170M  | 9,500,000|
+|* 2 |   TABLE ACCESS FULL    |      1 |    15M |   15M  |   450,000|
+|* 3 |   TABLE ACCESS FULL    |      1 |   170M |  170M  | 9,050,000|
+------------------------------------------------------------------------------------------------
+
+Predicate Information
+---------------------------------------------------
+1 - access("H"."PRODUCT_ID" = "S"."PRODUCT_ID")
+1 - filter("S"."SALE_DTM" >= "H"."VALID_FROM"
+           AND "S"."SALE_DTM" < "H"."VALID_TO")
+```
+
+- 추가 정보
+	- 상품당 평균 가격이력은 30건
+	- 해시 조인의 Access Predicate는 `PRODUCT_ID`뿐
+	- 해시 버킷에서 동일한 `PRODUCT_ID`를 가진 가격이력 평균 30건이 판매 1건의 후보가 되며, 각 후보에 대해 기간 조건이 평가됨
+	- 논리적인 후보 비교 및 기간 조건 평가 횟수는 수십억 회까지 증가할 수 있음
+
+- 출제 질문
+1. 해시 조인의 Access Predicate와 Filter Predicate를 구분하여 설명하시오.
+2. 해시 조인에서 최종 결과 건수보다 과도하게 많은 이력 후보에 대해 기간 조건이 평가되는 이유를 설명하시오.
+3. 가격이력 중 조회 기간과 겹치는 선분만 먼저 추출하도록 SQL을 개선하시오.
+4. 이 조인에서 소트 머지 조인 또는 Band Join을 검토할 수 있는 이유를 설명하고, 입력 집합 정렬 비용까지 고려하여 해시 조인보다 유리할 수 있는 조건을 설명하시오.
+5. 조회 대상이 특정 상품군의 하루 판매 약 3,000건으로 축소되는 경우, 전체 상품의 1년 조회와 비교하여 적합한 조인 방식이 달라질 수 있는 이유를 설명하시오.
+
+---
+
+### 문제 4. 선분이력 자체를 만드는 문제
+
+- 변경점 이력
+
+```sql
+CREATE TABLE PRODUCT_PRICE_CHANGE
+(
+    PRODUCT_ID    NUMBER NOT NULL,
+    CHANGE_DTM    DATE   NOT NULL,
+    SALE_PRICE    NUMBER NOT NULL,
+    CONSTRAINT PRODUCT_PRICE_CHANGE_PK
+        PRIMARY KEY (PRODUCT_ID, CHANGE_DTM)
+);
+```
+
+- 데이터 저장 형태
+
+| PRODUCT_ID | CHANGE_DTM | SALE_PRICE |
+|------------|------------|-----------:|
+| 100        | 2026-01-01 | 10,000원   |
+| 100        | 2026-03-01 | 12,000원   |
+| 100        | 2026-06-15 | 11,000원   |
+
+- 추가 정보
+  - 전체 1,500만 건
+  - 상품당 평균 30개의 가격 변경이력
+  - 동일 상품에 동일한 `CHANGE_DTM`을 가진 이력은 존재하지 않음
+  - 최초 가격부터 현재 가격까지의 변경 시점만 저장하며 종료일은 별도로 관리하지 않음
+
+- 출제 질문
+1. 변경점 이력을 선분이력으로 변환한 후 판매 당시 가격을 조회하도록 SQL을 작성하시오.
+2. 매번 1,500만 건에 `LEAD`를 수행하면 어떤 비용이 발생하는지 설명하시오.
+3. 선분이력을 매번 계산하지 않고 별도 테이블로 관리하는 방안의 장단점을 설명하시오.
+4. 종료일을 `DATE '9999-12-31'`로 관리하는 방식과 `NULL`로 관리하는 방식의 차이를 설명하시오.
+5. 기간 조건에서 `BETWEEN` 대신 `>= VALID_FROM AND < VALID_TO`를 사용하는 이유를 설명하시오.
+
+**답변**
+
+- [[SQLP 스터디] 5주차 - 제4장 조인 튜닝 Ⅹ.문제풀이](https://m.blog.naver.com/biyoonx/224357799010)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+<summary>이지은🙋🏻‍♀️</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>Q. 환자 진료 및 입원/처방 환경에서의 조인 튜닝</summary>
+  
+  ### 주요 테이블
+
+1.  환자 마스터 : `TB_PATIENT`
+    - 데이터 규모 : 100만 건
+    - PK : PATIENT_ID
+2. 진료 트랜잭션 : `TB_TREATMENT`
+    - 데이터 규모 : 5,000만 건
+    - PK : TREATMENT_ID
+    - FK : PATIENT_ID, DOCTOR_ID
+    - 데이터 분포 : 환자 1명당 평균 50건의 진료 내역 보유
+3.  입원 내역 : `TB_ADMISSION`
+    - 데이터 규모 : 200만 건
+    - PK : ADMISSION_ID
+    - FK : PATIENT_ID
+    - 데이터 분포 : 전체 환자 100만 명 중 입원 경험이 있는 환자는 약 10만 명 (10% 수준)
+4. 처방 상세 : `TB_PRESCRIPTION`
+    - 데이터 규모 : 1억 5,000만 건
+    - PK : PRESCRIPTION_ID
+    - FK : TREATMENT_ID
+    - 데이터 분포 : 진료 1건당 평균 3건의 약제/처방 내역 발생 (1:N 관계)
+5. 의사 마스터 : `TB_DOCTOR_MASTER`
+    - 데이터 규모 : 5,000건
+    - PK : DOCTOR_ID
+    - 재직 의사 : WORK_STATUS = 'Y'는 4,000건
+6. 진료과 마스터 : `TB_DEPARTMENT`
+    - 데이터 규모 : 100건
+    - PK : DEPT_CD
+
+### 주요 인덱스
+
+```sql
+TB_PATIENT_PK          (PATIENT_ID)
+TB_PATIENT_X01         (REG_DATE, PATIENT_ID)
+
+TB_ADMISSION_X01       (PATIENT_ID, ADMIT_DT)
+TB_ADMISSION_X02       (ADMIT_DT, PATIENT_ID)
+
+TB_TREATMENT_X01       (PATIENT_ID, TREATMENT_DTM, TREATMENT_ID)
+TB_TREATMENT_X02       (DOCTOR_ID, TREATMENT_DTM)
+
+TB_PRESCRIPTION_X01    (TREATMENT_ID, DRUG_CD)
+TB_PRESCRIPTION_X02    (DRUG_CD, TREATMENT_ID)
+
+TB_DOCTOR_MASTER_X01   (DEPT_CD, WORK_STATUS, DOCTOR_ID)
+```
+
+---
+
+#### 문제 1. 다중 1:N 조인의 행 증폭과 세미 조인 전환
+
+2026년에 입원한 이력이 있고, 같은 해에 특정 약제 `D001`을 처방받은 적이 있는 환자의 중복 없는 목록을 조회한다.
+
+```sql
+SELECT DISTINCT
+       P.PATIENT_ID,
+       P.PATIENT_NM
+FROM TB_PATIENT P
+JOIN TB_ADMISSION A
+  ON A.PATIENT_ID = P.PATIENT_ID
+JOIN TB_TREATMENT T
+  ON T.PATIENT_ID = P.PATIENT_ID
+JOIN TB_PRESCRIPTION R
+  ON R.TREATMENT_ID = T.TREATMENT_ID
+WHERE A.ADMIT_DT >= DATE '2026-01-01'
+  AND A.ADMIT_DT <  DATE '2027-01-01'
+  AND T.TREATMENT_DTM >= DATE '2026-01-01'
+  AND T.TREATMENT_DTM <  DATE '2027-01-01'
+  AND R.DRUG_CD = 'D001';
+```
+
+동일 환자에게 입원 이력이 여러 건 있고 `D001` 처방 이력도 여러 건 존재하면, 환자별 입원 건수와 처방 건수의 조합만큼 중간 결과가 증가한다. 이후 `DISTINCT`로 환자 중복을 제거하면서 정렬 또는 해시 기반 중복 제거 부하가 발생한다.
+
+1. 조인 조건이 모두 존재함에도 중간 결과가 크게 증가하는 이유를 집합 관점에서 설명하시오.
+2. `DISTINCT`를 제거하고 `EXISTS`를 이용해 존재 여부만 확인하도록 SQL을 재작성하시오.
+3. `EXISTS`를 사용하면 항상 행별 조기 종료 방식으로 실행되는지 설명하시오.
+
+---
+
+#### 문제 2. Outer Join 이후 집계와 선집계 튜닝
+
+전체 진료과별로 재직 의사 수와 최근 1개월 총 진료비를 조회한다. 재직 의사가 없거나 진료가 없는 진료과도 출력해야 한다.
+
+```sql
+SELECT D.DEPT_CD,
+       COUNT(DISTINCT M.DOCTOR_ID) AS DOCTOR_CNT,
+       SUM(T.TREATMENT_COST)       AS TOTAL_COST
+FROM TB_DEPARTMENT D
+LEFT JOIN TB_DOCTOR_MASTER M
+  ON M.DEPT_CD = D.DEPT_CD
+ AND M.WORK_STATUS = 'Y'
+LEFT JOIN TB_TREATMENT T
+  ON T.DOCTOR_ID = M.DOCTOR_ID
+ AND T.TREATMENT_DTM >= :FROM_DT
+ AND T.TREATMENT_DTM <  :TO_DT
+GROUP BY D.DEPT_CD;
+```
+
+최근 한 달 진료 데이터는 약 900만 건이다.
+
+1. 의사와 진료 데이터를 먼저 조인한 뒤 `COUNT(DISTINCT)`와 `GROUP BY`를 수행할 때 발생하는 집합 팽창을 설명하시오.
+2. `TB_TREATMENT`를 의사별로 먼저 집계한 뒤 의사 마스터와 조인하도록 SQL을 개선하시오.
+3. 선집계 방식에서도 전체 진료과와 진료 없는 의사가 누락되지 않게 하려면 무엇을 주의해야 하는지 설명하시오.
+
+---
+
+#### 문제 3. 비병합 집계 뷰와 조건절 푸시
+
+특정 환자의 기본 정보와 누적 진료비를 조회한다.
+
+```sql
+SELECT P.PATIENT_ID,
+       P.PATIENT_NM,
+       V.TOTAL_COST
+FROM TB_PATIENT P
+JOIN (
+    SELECT PATIENT_ID,
+           SUM(TREATMENT_COST) AS TOTAL_COST
+    FROM TB_TREATMENT
+    GROUP BY PATIENT_ID
+) V
+  ON V.PATIENT_ID = P.PATIENT_ID
+WHERE P.PATIENT_ID = :PATIENT_ID;
+```
+
+실제 실행계획을 확인한 결과, 인라인 뷰에서 `TB_TREATMENT` 5,000만 건 전체를 환자별로 집계한 뒤 특정 환자 한 명과 조인하는 계획이 선택되었다고 가정한다.
+
+1. View Merging과 Predicate Pushing의 차이를 설명하시오.
+2. 집계 뷰가 Merge되지 않더라도 상위의 환자 조건이 내부로 전달될 수 있는지 설명하시오.
+3. 전체 집계를 확실하게 방지하도록 SQL을 리팩토링하시오.
+4. 상관 스칼라 서브쿼리로 변경할 경우 유리한 조건과 불리한 조건을 설명하시오.
+
+---
+
+#### 문제 4. NOT EXISTS Unnesting과 Anti Join
+
+2025년 이후 가입한 환자 중 2026년 이후 입원 이력이 없는 외래 전용 환자를 조회한다.
+
+```sql
+SELECT P.PATIENT_ID,
+       P.PATIENT_NM,
+       P.PHONE_NO
+FROM TB_PATIENT P
+WHERE P.REG_DATE >= DATE '2025-01-01'
+  AND NOT EXISTS (
+      SELECT /*+ QB_NAME(SQ) NO_UNNEST */ 1
+      FROM TB_ADMISSION A
+      WHERE A.PATIENT_ID = P.PATIENT_ID
+        AND A.ADMIT_DT >= DATE '2026-01-01'
+  );
+```
+
+실행계획에서 외부 환자 후보는 50만 건이며, 서브쿼리 Row Source의 Starts가 약 50만 회로 확인되었다고 가정한다.
+
+실제 실행 통계 일부는 다음과 같다.
+
+```sql
+--------------------------------------------------------------------------------
+| Id | Operation                           | Starts | A-Rows | Buffers           |
+--------------------------------------------------------------------------------
+|  1 | FILTER                              |      1 | 450000 | 1800000           |
+|  2 |  TABLE ACCESS BY INDEX ROWID PATIENT|      1 | 500000 |  600000           |
+|  3 |   INDEX RANGE SCAN PATIENT_X01      |      1 | 500000 |  100000           |
+|  4 |  INDEX RANGE SCAN ADMISSION_X01     | 500000 |  50000 | 1200000           |
+--------------------------------------------------------------------------------
+```
+
+1. `NOT EXISTS`가 Unnesting될 때 Anti Join으로 변환되는 원리를 설명하시오.
+2. Unnesting되지 않고 FILTER 방식으로 처리될 때 Starts가 증가하는 이유를 설명하시오.
+3. NO_UNNEST를 제거한 SQL과 명시적 Anti Join 재작성 SQL을 각각 작성하시오.
+4. Hash Anti Join이 항상 FILTER 또는 Nested Loops Anti Join보다 좋은지 설명하시오.
+5. INDEX RANGE SCAN ADMISSION_X01의 A-Rows는 5만 건인데 Starts는 50만 건인 이유를 설명하시오.
+
+**답변**
+
+- [https://app.notion.com/p/leeeden/4-3a670b7b39f480968dafdf02765751c2?source=copy_link](https://app.notion.com/p/leeeden/4-3a670b7b39f480968dafdf02765751c2?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>해시 조인 / 스칼라 서브쿼리 튜닝</summary>
+  
+  ### 데이터 특성
+
+```
+주문    테이블 : 일별 약 100만건, 누적 약 3억건
+반품    테이블 : 일별 약 10만건,  누적 약 3천만건
+고객    테이블 : 총 10만명 (고객번호 NDV = 10만)
+VIP고객 테이블 : 총 1만명
+```
+
+### 테이블 및 인덱스 구성
+
+```
+주문    : 주문_PK    (주문일자, 고객번호)
+반품    : 반품_PK    (반품일자, 고객번호)
+고객    : 고객_PK    (고객번호)
+VIP고객 : VIP고객_PK (고객번호)
+```
+
+### 상황
+
+```
+운영팀으로부터 월별 주문/반품 현황 집계 쿼리가 매우 느리다는 신고가 들어왔다.
+담당자는 아래와 같이 두 차례 튜닝을 시도했으나 여전히 성능이 개선되지 않고 있다.
+```
+
+### 현재 쿼리
+
+```sql
+SELECT a.고객번호,
+       b.고객명,
+       SUM(a.주문금액) AS 주문금액합계,
+       SUM(c.반품금액) AS 반품금액합계
+FROM   주문 a,
+       고객 b,
+       반품 c
+WHERE  a.고객번호  = b.고객번호
+AND    a.고객번호  = c.고객번호(+)
+AND    a.주문일자  BETWEEN :시작일자 AND :종료일자
+AND    c.반품일자  BETWEEN :시작일자 AND :종료일자
+GROUP BY a.고객번호, b.고객명
+ORDER BY 주문금액합계 DESC;
+```
+
+### 실행계획 1 (현재)
+
+```sql
+------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name    | E-Rows  | E-Bytes | Cost (%CPU)  | Time     |
+------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |         |  100000 |    6M   |  3820K  (3)  | 12:42:00 |
+|   1 |  SORT ORDER BY                |         |  100000 |    6M   |  3820K  (3)  | 12:42:00 |
+|   2 |   HASH GROUP BY               |         |  100000 |    6M   |  3820K  (3)  | 12:42:00 |
+|   3 |    NESTED LOOPS OUTER         |         |  30000K |    1G   |  3820K  (3)  | 12:42:00 |
+|   4 |     NESTED LOOPS              |         |  30000K |  900M   |  1910K  (2)  | 06:22:00 |
+|*  5 |      TABLE ACCESS FULL        | 주문    |  30000K |  570M   |   955K  (1)  | 03:11:00 |
+|   6 |      TABLE ACCESS BY ROWID    | 고객    |       1 |      26 |       2 (0)  | 00:00:01 |
+|*  7 |       INDEX UNIQUE SCAN       | 고객_PK |       1 |         |       1 (0)  | 00:00:01 |
+|*  8 |     TABLE ACCESS FULL         | 반품    |   3000K |      48M|       2 (0)  | 00:00:04 |
+------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   5 - filter("A"."주문일자" BETWEEN :시작일자 AND :종료일자)
+   7 - access("A"."고객번호" = "B"."고객번호")
+   8 - filter("C"."고객번호"(+) = "A"."고객번호"
+           AND "C"."반품일자"(+) BETWEEN :시작일자 AND :종료일자)
+```
+
+### 1차 튜닝 - 인덱스 추가
+
+```sql
+CREATE INDEX 주문_IDX01 ON 주문 (주문일자, 고객번호, 주문금액);
+CREATE INDEX 반품_IDX01 ON 반품 (반품일자, 고객번호, 반품금액);
+```
+
+### 실행계획 2 (1차 튜닝 후)
+
+```sql
+------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows  | E-Bytes | Cost (%CPU)  | Time     |
+------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |  100000 |    6M   |  1250K  (3)  | 04:10:00 |
+|   1 |  SORT ORDER BY                |            |  100000 |    6M   |  1250K  (3)  | 04:10:00 |
+|   2 |   HASH GROUP BY               |            |  100000 |    6M   |  1250K  (3)  | 04:10:00 |
+|   3 |    NESTED LOOPS OUTER         |            |  30000K |    1G   |  1250K  (3)  | 04:10:00 |
+|   4 |     NESTED LOOPS              |            |  30000K |  900M   |   625K  (2)  | 02:05:00 |
+|*  5 |      INDEX RANGE SCAN         | 주문_IDX01 |  30000K |  570M   |   310K  (1)  | 01:02:00 |
+|   6 |      TABLE ACCESS BY ROWID    | 고객       |       1 |      26 |       2 (0)  | 00:00:01 |
+|*  7 |       INDEX UNIQUE SCAN       | 고객_PK    |       1 |         |       1 (0)  | 00:00:01 |
+|*  8 |      INDEX RANGE SCAN         | 반품_IDX01 |   3000K |     48M |       2 (0)  | 00:00:04 |
+------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   5 - access("A"."주문일자" BETWEEN :시작일자 AND :종료일자)
+   7 - access("A"."고객번호" = "B"."고객번호")
+   8 - access("C"."반품일자"(+) BETWEEN :시작일자 AND :종료일자)
+       filter("C"."고객번호"(+) = "A"."고객번호")
+```
+
+### 2차 튜닝 - 해시 조인으로 변경
+
+```sql
+SELECT /*+ USE_HASH(a b c) */
+       a.고객번호,
+       b.고객명,
+       SUM(a.주문금액) AS 주문금액합계,
+       SUM(c.반품금액) AS 반품금액합계
+FROM   주문 a,
+       고객 b,
+       반품 c
+WHERE  a.고객번호  = b.고객번호
+AND    a.고객번호  = c.고객번호(+)
+AND    a.주문일자  BETWEEN :시작일자 AND :종료일자
+AND    c.반품일자  BETWEEN :시작일자 AND :종료일자
+GROUP BY a.고객번호, b.고객명
+ORDER BY 주문금액합계 DESC;
+```
+
+### 실행계획 3 (2차 튜닝 후)
+
+```sql
+------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows  | E-Bytes | Cost (%CPU)  | Time     |
+------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |  100000 |    6M   |   850K  (5)  | 02:50:00 |
+|   1 |  SORT ORDER BY                |            |  100000 |    6M   |   850K  (5)  | 02:50:00 |
+|   2 |   HASH GROUP BY               |            |  100000 |    6M   |   850K  (5)  | 02:50:00 |
+|*  3 |    HASH JOIN OUTER            |            |  30000K |    1G   |   820K  (5)  | 02:44:00 |
+|   4 |     HASH JOIN                 |            |  30000K |  900M   |   410K  (4)  | 01:22:00 |
+|*  5 |      INDEX RANGE SCAN         | 주문_IDX01 |  30000K |  570M   |   310K  (1)  | 01:02:00 |
+|   6 |      TABLE ACCESS FULL        | 고객       |  100000 |    2M   |    50K  (1)  | 00:10:00 |
+|*  7 |     INDEX RANGE SCAN          | 반품_IDX01 |   3000K |     48M |   100K  (1)  | 00:20:00 |
+------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   3 - access("A"."고객번호" = "C"."고객번호"(+))
+       filter("C"."반품일자"(+) BETWEEN :시작일자 AND :종료일자)
+   4 - access("A"."고객번호" = "B"."고객번호")
+   5 - access("A"."주문일자" BETWEEN :시작일자 AND :종료일자)
+   7 - access("C"."반품일자" BETWEEN :시작일자 AND :종료일자)
+```
+
+---
+
+### 문제
+
+1. 실행계획 1에서 주문 테이블에 TABLE ACCESS FULL이 발생한 이유
+
+2. 1차 튜닝(인덱스 추가) 후 실행계획 2에서 Cost는 감소했으나
+   여전히 느린 이유를 아래 관점에서 설명하시오.
+   - NL 조인과 대량 데이터의 관계
+   - 반품 테이블 Predicate Information에서 filter가 발생한 이유와 그 영향
+
+3. 2차 튜닝(해시 조인) 후 실행계획 3에서도 여전히 느릴 수 있는 이유를
+   아래 관점에서 설명하시오.
+   - 해시 조인의 동작 방식 (Build Input / Probe Input)
+   - PGA 부족 시 발생하는 문제
+
+4. 해시 조인 성능을 높이기 위한 Build Input과 Probe Input 선택 기준을 설명하고
+   현재 실행계획 3에서 조인 순서가 적절한지 판단하여
+   힌트와 함께 개선 쿼리를 작성하시오.
+
+5. 고객명을 조인 대신 아래와 같이 스칼라 서브쿼리로 변경했을 때의
+   장단점을 설명하고 현재 데이터 특성(고객번호 NDV = 10만)에서
+   캐싱 효과가 효율적인지 판단하시오.
+
+```sql
+   SELECT a.고객번호,
+          (SELECT 고객명 FROM 고객 WHERE 고객번호 = a.고객번호) AS 고객명,
+          SUM(a.주문금액) AS 주문금액합계,
+          SUM(c.반품금액) AS 반품금액합계
+   FROM   주문 a,
+          반품 c
+   WHERE  a.고객번호  = c.고객번호(+)
+   AND    a.주문일자  BETWEEN :시작일자 AND :종료일자
+   AND    c.반품일자  BETWEEN :시작일자 AND :종료일자
+   GROUP BY a.고객번호
+   ORDER BY 주문금액합계 DESC;
+```
+
+6. 아래 EXISTS 서브쿼리에서 Unnesting과 No-Unnesting의
+   실행계획 차이를 설명하고 각각 유리한 상황을 서술하시오.
+
+```sql
+   SELECT a.고객번호,
+          SUM(a.주문금액) AS 주문금액합계
+   FROM   주문 a
+   WHERE  a.주문일자 BETWEEN :시작일자 AND :종료일자
+   AND    EXISTS (SELECT 1 FROM VIP고객 WHERE 고객번호 = a.고객번호)
+   GROUP BY a.고객번호
+   ORDER BY 주문금액합계 DESC;
+```
+
+**답변**
+
+- 추가 예정
+</details>
+</dd>
+</dl>
+</details>
 
 ---
 
@@ -2987,10 +3661,12 @@ SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL,
 #### 제2절 SQL 공유 및 재사용
 #### 제3절 쿼리 변환
 
+### 7주차 : 제6장 고급 SQL 튜닝
+#### 제1절 소트 튜닝
+
 ---
 
 ### 7주차 : 제6장 고급 SQL 튜닝
-#### 제1절 소트 튜닝
 #### 제2절 DML 튜닝
 #### 제3절 데이터베이스 Call 최소화
 #### 제4절 파티셔닝
