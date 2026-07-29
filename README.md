@@ -3648,7 +3648,7 @@ Predicate Information (identified by operation id):
 
 **답변**
 
-- 추가 예정
+- [https://app.notion.com/p/SQLP-4-3a7894b3ff3280348ae8e0503223f37b?source=copy_link](https://app.notion.com/p/SQLP-4-3a7894b3ff3280348ae8e0503223f37b?source=copy_link)
 </details>
 </dd>
 </dl>
