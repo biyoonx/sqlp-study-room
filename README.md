@@ -4054,7 +4054,7 @@ FETCH FIRST 100 ROWS ONLY;
   <summary>이시향🙋🏻‍♀️</summary>
   
   - [x] 주제 핵심 및 문제풀이 전략
-  - [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅰ-Ⅸ](https://blog.naver.com/biyoonx/224329298300)(링크변경예정)
+  - [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅰ-Ⅸ](https://blog.naver.com/biyoonx/224367161423)
   - [x] 주제에 대한 서술형 문제 및 풀이 공유
 
 <dl>
@@ -4212,7 +4212,7 @@ WINDOW SORT PUSHED RANK   180MB   180MB   160MB       18GB
 
 **답변**
 
-- [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅹ.문제풀이 문제 1](https://blog.naver.com/biyoonx/224329298300)(링크변경예정)
+- [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅹ.문제풀이](https://blog.naver.com/biyoonx/224367161423)
 </details>
 </dd>
 </dl>
