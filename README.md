@@ -3661,7 +3661,7 @@ Predicate Information (identified by operation id):
 #### 제2절 SQL 공유 및 재사용
 #### 제3절 쿼리 변환
 
-### 7주차 : 제6장 고급 SQL 튜닝
+### 제6장 고급 SQL 튜닝
 #### 제1절 소트 튜닝
 
 <details>
