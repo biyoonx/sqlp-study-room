@@ -3656,13 +3656,567 @@ Predicate Information (identified by operation id):
 
 ---
 
-### 6주차 : 제5장 SQL 옵티마이저
+### 6주차 : 제5장 SQL 옵티마이저(2026-08-01)
 #### 제1절 SQL 옵티마이저 원리
 #### 제2절 SQL 공유 및 재사용
 #### 제3절 쿼리 변환
 
 ### 7주차 : 제6장 고급 SQL 튜닝
 #### 제1절 소트 튜닝
+
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>소트 튜닝 + 쿼리 변환</summary>
+  
+  ### 데이터 특성
+
+```
+주문    테이블 : 전체 500만건, 최근 1년 데이터
+고객번호 NDV   : 100,100명
+                 - 일반 고객 100,000명 : 1인당 평균 40건 (총 400만건)
+                 - 헤비유저      100명 : 1인당 평균 10,000건 (총 100만건)
+주문상태       : COMPLETE 95%, CANCEL 5%
+```
+
+### 테이블 및 인덱스 구성
+
+```sql
+CREATE TABLE 주문
+(
+    주문번호   NUMBER        NOT NULL,
+    고객번호   VARCHAR2(10)  NOT NULL,
+    주문일자   DATE          NOT NULL,
+    주문상태   VARCHAR2(10)  NOT NULL,
+    주문금액   NUMBER        NOT NULL,
+    CONSTRAINT 주문_PK PRIMARY KEY (주문번호)
+);
+
+CREATE INDEX 주문_X01 ON 주문 (고객번호, 주문상태, 주문일자 DESC);
+```
+
+### 상황
+
+```
+쇼핑몰 고객 상세 페이지에서 "최근 주문 내역 TOP 10"을 보여주는 쿼리가
+고객마다 응답 속도 편차가 심하다는 신고가 들어왔다.
+```
+
+### 현재 쿼리
+
+```sql
+SELECT 주문번호, 주문일자, 주문금액, 주문상태
+FROM   주문
+WHERE  고객번호 = :cust_no
+AND   (주문상태 = :status OR :status IS NULL)
+ORDER BY 주문일자 DESC
+FETCH FIRST 10 ROWS ONLY;
+```
+
+### 실행계획 1 (일반 고객, :status = 'COMPLETE' 로 조회)
+
+```sql
+------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows | Cost (%CPU) |
+------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |     10 |      12 (0) |
+|*  1 |  SORT ORDER BY STOPKEY        |            |     10 |      12 (0) |
+|   2 |   TABLE ACCESS BY INDEX ROWID | 주문       |     38 |      11 (0) |
+|*  3 |    INDEX RANGE SCAN           | 주문_X01   |     40 |       3 (0) |
+------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter(ROWNUM <= 10)
+   3 - access("고객번호" = :CUST_NO)
+       filter("주문상태" = :STATUS OR :STATUS IS NULL)
+```
+
+일반 고객이 조회했을 때는 큰 지연 없이 수행되었다.
+
+### 실행계획 1-1 (헤비유저, :status = 'COMPLETE' 로 조회 - 동일 쿼리)
+
+```sql
+------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows | Cost (%CPU) |
+------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |     10 |    3500 (0) |
+|*  1 |  SORT ORDER BY STOPKEY        |            |     10 |    3500 (0) |
+|   2 |   TABLE ACCESS BY INDEX ROWID | 주문       |   9500 |    2750 (0) |
+|*  3 |    INDEX RANGE SCAN           | 주문_X01   |  10000 |     750 (0) |
+------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter(ROWNUM <= 10)
+   3 - access("고객번호" = :CUST_NO)
+       filter("주문상태" = :STATUS OR :STATUS IS NULL)
+```
+
+반면 헤비유저가 동일한 쿼리로 조회했을 때는 체감 성능이 크게 저하되었다.
+
+---
+
+### 1차 조치 - OR 조건을 제거하고 상태값을 필수 파라미터로 변경
+
+```sql
+SELECT 주문번호, 주문일자, 주문금액, 주문상태
+FROM   주문
+WHERE  고객번호 = :cust_no
+AND    주문상태 = :status
+ORDER BY 주문일자 DESC
+FETCH FIRST 10 ROWS ONLY;
+```
+
+### 실행계획 2 (일반 고객, OR 제거, :status = 'COMPLETE')
+
+```sql
+------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows | Cost (%CPU) |
+------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |     10 |       4 (0) |
+|*  1 |  COUNT STOPKEY                |            |        |             |
+|   2 |   TABLE ACCESS BY INDEX ROWID | 주문       |     38 |       4 (0) |
+|*  3 |    INDEX RANGE SCAN           | 주문_X01   |     38 |       3 (0) |
+------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter(ROWNUM <= 10)
+   3 - access("고객번호" = :CUST_NO AND "주문상태" = :STATUS)
+```
+
+### 실행계획 2-1 (헤비유저, OR 제거, :status = 'COMPLETE')
+
+```sql
+------------------------------------------------------------------------------
+| Id  | Operation                     | Name       | E-Rows | Cost (%CPU) |
+------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |            |     10 |       4 (0) |
+|*  1 |  COUNT STOPKEY                |            |        |             |
+|   2 |   TABLE ACCESS BY INDEX ROWID | 주문       |   9500 |       4 (0) |
+|*  3 |    INDEX RANGE SCAN           | 주문_X01   |   9500 |       3 (0) |
+------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter(ROWNUM <= 10)
+   3 - access("고객번호" = :CUST_NO AND "주문상태" = :STATUS)
+```
+
+1차 조치 이후에는 일반 고객과 헤비유저 모두 Cost가 4로 동일해졌고, 
+실제 체감 성능도 고객 구분 없이 즉시 응답하는 수준으로 균일해졌다.
+
+---
+
+### 문제
+
+1. 실행계획 1에서 `SORT ORDER BY STOPKEY` 가 발생하는 이유를 아래 항목을 포함하여 설명하시오.
+   - TABLE ACCESS BY INDEX ROWID 단계 E-Rows(38)의 예측 근거
+   - `"주문상태 = :STATUS OR :STATUS IS NULL"` 조건이  access가 아닌 filter로 처리되는 이유와 OR-Expansion으로 처리되지 않는 이유
+
+2. 실행계획 1(일반 고객, Cost 12)과 실행계획 1-1(헤비유저, Cost 3500)을 비교하여, 같은 쿼리인데도 고객에 따라 응답 속도 편차가 발생하는 이유를 `SORT ORDER BY STOPKEY` 의 동작 방식과 연관지어 설명하시오.
+
+3. OR 조건 제거 후 실행계획 2에서 `SORT ORDER BY` 가 사라지고 `COUNT STOPKEY` 만 남는 이유를 `주문_X01` 인덱스 구조와 연관지어 설명하시오.
+
+4. 실행계획 2와 실행계획 2-1을 비교하면, 1차 조치 이후에는 대상 건수가 크게 다름에도 Cost가 동일하게 나타난다. 이 현상을 `COUNT STOPKEY` 의 부분범위 처리 원리로 설명하고, 문제 2번에서 확인한 `SORT ORDER BY STOPKEY` 와의 근본적인 차이를 근거로, SQL 튜닝 시 정렬 컬럼과 인덱스 컬럼 순서를 어떻게 설계해야 하는지 일반적인 원칙을 제시하시오.
+
+5. 아래는 동일 인덱스(주문_X01)를 사용하는 또 다른 쿼리와 그 실행계획이다.
+    
+    ```sql
+    SELECT 주문번호, 주문일자, 주문금액, 주문상태
+    FROM   주문
+    WHERE  고객번호 = :cust_no
+    AND   (주문상태 = 'COMPLETE' OR 주문일자 = DATE '2026-08-01')
+    ORDER BY 주문일자 DESC
+    FETCH FIRST 10 ROWS ONLY;
+    ```
+    
+    ```sql
+    ------------------------------------------------------------------------------
+    | Id  | Operation                     | Name       | E-Rows | Cost (%CPU) |
+    ------------------------------------------------------------------------------
+    |   0 | SELECT STATEMENT              |            |     10 |       6 (0) |
+    |*  1 |  SORT ORDER BY STOPKEY        |            |     10 |       6 (0) |
+    |   2 |   CONCATENATION               |            |        |             |
+    |   3 |    TABLE ACCESS BY INDEX ROWID| 주문       |     38 |       4 (0) |
+    |*  4 |     INDEX RANGE SCAN          | 주문_X01   |     38 |       3 (0) |
+    |   5 |    TABLE ACCESS BY INDEX ROWID| 주문       |      1 |       2 (0) |
+    |*  6 |     INDEX RANGE SCAN          | 주문_X01   |     40 |       3 (0) |
+    ------------------------------------------------------------------------------
+    
+    Predicate Information (identified by operation id):
+    ---------------------------------------------------
+       1 - filter(ROWNUM <= 10)
+       4 - access("고객번호" = :CUST_NO AND "주문상태" = 'COMPLETE')
+       6 - access("고객번호" = :CUST_NO)
+           filter("주문일자" = DATE '2026-08-01'
+                  AND LNNVL("주문상태" = 'COMPLETE'))
+    ```
+    
+    - 이 쿼리에서 OR-Expansion이 발생할 수 있었던 이유를 문제 1의 쿼리와 비교하여 설명하시오.
+    - 두 번째 브랜치(Id 5, 6)의 Predicate Information에 LNNVL 함수가 사용된 이유를 설명하시오.
+
+**답변**
+
+- [[SQLP] 제5장&6장(1) 문제 및 풀이](https://app.notion.com/p/SQLP-5-6-1-3af894b3ff3280f8af7cca9a2413c053?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+<summary>이지은🙋🏻‍♀️</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+    <summary>Q. 대용량 진료 이력 조회 환경에서의 SQL 옵티마이저 분석 및 소트 튜닝</summary>
+  
+  ### 업무 요구사항
+
+최근 1년간 완료된 진료를 기준으로 다음 정보를 조회한다.
+
+- 환자번호, 환자명, 환자별 총 진료비
+- 가장 최근 진료번호, 가장 최근 진료일시, 가장 최근 진료과명
+- 총 진료비가 높은 순으로 상위 100명
+
+정렬 우선순위는 다음과 같다.
+
+1. 총 진료비 내림차순
+2. 최근 진료일시 내림차순
+3. 환자번호 내림차순
+
+### 주요 테이블
+
+1. 환자 마스터 : `TB_PATIENT`
+    - 데이터 규모 : 1,000,000건
+    - PATIEND ID : 환자번호 / PATIENT_NM : 환자명
+2. 진료 이력 : `TB_TREATMENT`
+    - 데이터 규모 : 120,000,000건
+    - 최근 1년 완료 진료 : 12,000,000건
+    - 최근 1년 진료 환자 : 850,000명
+    - TREATMENT_ID : 진료번호 / PATIENT_ID : 환자번호 / TREATMENT_DTM : 진료일시 / TREATMENT_COST : 진료비 / TREATMENT_STAT_CD : 진료상태 / DEPT_CD : 진료과 코드
+3. 진료과 : `TB_DEPARTMENT`
+    - 데이터 규모 : 300건
+    - DEPT_CD : 진료과 코드 / DEPT_NM : 진료과명
+
+### 기존 SQL
+
+```sql
+SELECT DISTINCT
+       X.PATIENT_ID,
+       X.PATIENT_NM,
+       X.TOTAL_COST,
+       X.TREATMENT_ID,
+       X.TREATMENT_DTM,
+       D.DEPT_NM
+FROM (
+    SELECT P.PATIENT_ID,
+           P.PATIENT_NM,
+           T.TREATMENT_ID,
+           T.TREATMENT_DTM,
+           T.DEPT_CD,
+           SUM(T.TREATMENT_COST)
+               OVER (
+                   PARTITION BY T.PATIENT_ID
+               ) AS TOTAL_COST,
+           ROW_NUMBER()
+               OVER (
+                   PARTITION BY T.PATIENT_ID
+                   ORDER BY T.TREATMENT_DTM DESC,
+                            T.TREATMENT_ID DESC
+               ) AS RN
+    FROM TB_PATIENT P
+    JOIN TB_TREATMENT T
+      ON T.PATIENT_ID = P.PATIENT_ID
+    WHERE T.TREATMENT_STAT_CD = 'COMPLETE'
+      AND T.TREATMENT_DTM >= ADD_MONTHS(TRUNC(SYSDATE), -12)
+) X
+JOIN TB_DEPARTMENT D
+  ON D.DEPT_CD = X.DEPT_CD
+WHERE X.RN = 1
+ORDER BY X.TOTAL_COST DESC,
+         X.TREATMENT_DTM DESC,
+         X.PATIENT_ID DESC
+FETCH FIRST 100 ROWS ONLY;
+```
+
+### 실행계획 및 실행 통계
+
+```sql
+-------------------------------------------------------------------------------------------------------
+| Id | Operation                        | Starts | A-Rows | Buffers  | TempSpc | A-Time             |
+-------------------------------------------------------------------------------------------------------
+|  0 | SELECT STATEMENT                 |      1 |    100 | 1,420,000|         | 00:06:18           |
+|  1 |  SORT ORDER BY STOPKEY           |      1 |    100 | 1,420,000|   210M  | 00:06:18           |
+|  2 |   HASH UNIQUE                    |      1 | 850,000| 1,420,000|   620M  | 00:06:02           |
+|  3 |    HASH JOIN                     |      1 | 850,000| 1,420,000|         | 00:05:41           |
+|  4 |     TABLE ACCESS FULL DEPARTMENT |      1 |    300 |       12|         | 00:00:01           |
+|  5 |     VIEW                         |      1 | 850,000| 1,419,988|         | 00:05:40           |
+|  6 |      WINDOW SORT PUSHED RANK     |      1 |  12.0M| 1,419,988|    18G  | 00:05:32           |
+|  7 |       HASH JOIN                  |      1 |  12.0M| 1,419,988|         | 00:01:19           |
+|  8 |        TABLE ACCESS FULL PATIENT |      1 |   1.0M|    41,000|         | 00:00:06           |
+|  9 |        TABLE ACCESS FULL TREATMENT
+|                                        |      1 |  12.0M| 1,378,988|         | 00:01:08           |
+-------------------------------------------------------------------------------------------------------
+```
+
+---
+
+#### 문제 1.
+
+현재 실행계획에서 전체 수행시간에 가장 큰 영향을 미치는 연산을 선정하고 그 이유를 설명하시오.
+
+또한 실행계획에서 `WINDOW SORT PUSHED RANK`의 출력 건수(A-Rows 약 12,000,000건)와 `VIEW` 연산의 출력 건수(약 850,000건)를 근거로 옵티마이저가 Cardinality를 어떻게 계산하고 이후 조인 방식을 결정하는지 설명하시오.
+
+아울러 `TB_PATIENT`와 `TB_TREATMENT`의 조인에서 옵티마이저가 `HASH JOIN`을 선택한 이유를 처리 건수와 Cost 관점에서 기술하시오.
+
+---
+
+#### 문제 2.
+
+현재 SQL에서 `HASH UNIQUE`가 발생한 원인을 설명하고, 결과를 변경하지 않는 범위 내에서 이를 제거하도록 SQL을 수정하시오.
+
+수정한 SQL을 기준으로 다음 사항을 설명하시오.
+
+- `HASH UNIQUE`가 제거되는 이유
+- 분석 함수가 포함된 인라인 뷰에서 View Merging이 제한되는 이유
+- DISTINCT 제거가 실행계획과 TEMP 사용량에 미치는 영향
+
+---
+
+#### 문제 3.
+
+현재 SQL은 분석 함수를 이용하여 12,000,000건의 진료 데이터를 유지한 상태에서 환자별 집계를 수행한다.
+
+동일한 결과를 반환하도록 SQL을 재작성하시오.
+
+단,
+
+- 환자별 총 진료비
+- 가장 최근 진료
+- 가장 최근 진료과
+
+정보는 모두 유지되어야 하며, 동일한 진료일시에서는 진료번호가 가장 큰 건을 최근 진료로 판단한다.
+
+작성한 SQL을 기준으로 기존 방식과 비교하여 Cardinality 감소 시점이 어떻게 달라지는지 설명하고, 옵티마이저가 `HASH GROUP BY`를 선택할 가능성이 높은 이유를 기술하시오.
+
+---
+
+#### 문제 4.
+
+문제 3에서 작성한 SQL을 적용하였다고 가정할 때 실행계획이 어떻게 변경될지 설명하시오.
+
+다음 사항을 중심으로 기술하시오.
+
+- Cardinality 감소 시점
+- Join 입력 건수 변화
+- Sort 입력 건수 변화
+- PGA 및 TEMP 사용량 변화
+
+또한 `TB_TREATMENT`는 여전히 전체 12,000,000건을 읽는데도 전체 수행시간이 단축되는 이유를 설명하시오.
+
+---
+
+#### 문제 5.
+
+현재 SQL은 환자별 집계 결과 약 850,000건을 모두 조인한 후 최종 Top-N을 수행한다.
+
+정렬 기준이 모두 환자별 집계 결과에 존재한다는 점을 이용하여 Top-N을 먼저 수행하도록 SQL을 재작성하시오.
+
+또한 기존 방식과 비교하여 아래 관점에서 성능 향상 효과를 설명하시오.
+
+- 조인 처리량
+- `SORT ORDER BY STOPKEY`
+- Hard Parse
+- Soft Parse
+- 바인드 변수 사용에 따른 SQL 공유 및 재사용
+
+단, 진료상태별 데이터 분포가 크게 다른 경우 하나의 실행계획을 계속 재사용할 때 발생할 수 있는 문제도 함께 기술하시오.
+
+**답변**
+
+- [https://app.notion.com/p/leeeden/5-3ac70b7b39f4802c89fefe779ec93d6b?source=copy_link](https://app.notion.com/p/leeeden/5-3ac70b7b39f4802c89fefe779ec93d6b?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅰ-Ⅸ](https://blog.naver.com/biyoonx/224329298300)(링크변경예정)
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>Top-N 조회와 소트 튜닝</summary>
+  
+  ### 업무 상황
+
+특정 지역에서 지정한 기간 동안 발생한 정상 주문 중 주문금액이 큰 상위 100건을 조회한다.
+
+최근 조회 시간이 급격히 증가하고 TEMP 사용량이 커져 튜닝이 필요하다.
+
+### 테이블 및 데이터 특성
+
+#### ORDER_TXN
+
+* 전체 3억 건
+* 일평균 주문 50만 건
+* `STATUS_CD = '01'`인 정상 주문은 전체의 95%
+* 지역별 주문 분포의 편차가 큼
+* 현재 바인드 조건에 해당하는 실제 주문은 약 800만 건
+
+```sql
+CREATE TABLE ORDER_TXN
+(
+    ORDER_NO      NUMBER       NOT NULL,
+    CUST_ID       NUMBER       NOT NULL,
+    PRODUCT_ID    NUMBER       NOT NULL,
+    REGION_CD     VARCHAR2(2)  NOT NULL,
+    STATUS_CD     VARCHAR2(2)  NOT NULL,
+    ORDER_DTM     DATE         NOT NULL,
+    ORDER_AMT     NUMBER       NOT NULL,
+    CONSTRAINT ORDER_TXN_PK PRIMARY KEY (ORDER_NO)
+);
+```
+
+#### CUSTOMER
+
+* 전체 500만 건
+* `ADDRESS` 평균 길이 약 300바이트
+
+```sql
+CREATE TABLE CUSTOMER
+(
+    CUST_ID       NUMBER          NOT NULL,
+    CUST_NM       VARCHAR2(100)   NOT NULL,
+    ADDRESS       VARCHAR2(1000),
+    CONSTRAINT CUSTOMER_PK PRIMARY KEY (CUST_ID)
+);
+```
+
+#### PRODUCT
+
+* 전체 100만 건
+* `PRODUCT_DESC` 평균 길이 약 2,000바이트
+
+```sql
+CREATE TABLE PRODUCT
+(
+    PRODUCT_ID    NUMBER          NOT NULL,
+    PRODUCT_NM    VARCHAR2(200)   NOT NULL,
+    PRODUCT_DESC  VARCHAR2(4000),
+    CONSTRAINT PRODUCT_PK PRIMARY KEY (PRODUCT_ID)
+);
+```
+
+### 인덱스
+
+```sql
+CREATE INDEX ORDER_TXN_X01
+    ON ORDER_TXN
+       (REGION_CD, STATUS_CD, ORDER_DTM);
+
+CREATE INDEX ORDER_TXN_X02
+    ON ORDER_TXN
+       (REGION_CD, STATUS_CD, ORDER_AMT DESC, ORDER_DTM);
+```
+
+### 현재 SQL
+
+```sql
+SELECT ORDER_NO,
+       CUST_ID,
+       PRODUCT_ID,
+       ORDER_DTM,
+       ORDER_AMT,
+       CUST_NM,
+       ADDRESS,
+       PRODUCT_NM,
+       PRODUCT_DESC
+FROM (
+    SELECT O.ORDER_NO,
+           O.CUST_ID,
+           O.PRODUCT_ID,
+           O.ORDER_DTM,
+           O.ORDER_AMT,
+           C.CUST_NM,
+           C.ADDRESS,
+           P.PRODUCT_NM,
+           P.PRODUCT_DESC,
+           ROW_NUMBER() OVER (
+               ORDER BY O.ORDER_AMT DESC, O.ORDER_NO
+           ) AS RN
+    FROM ORDER_TXN O
+    JOIN CUSTOMER C
+      ON C.CUST_ID = O.CUST_ID
+    JOIN PRODUCT P
+      ON P.PRODUCT_ID = O.PRODUCT_ID
+    WHERE O.REGION_CD = :REGION_CD
+      AND O.STATUS_CD = '01'
+      AND O.ORDER_DTM >= :FROM_DTM
+      AND O.ORDER_DTM <  :TO_DTM
+)
+WHERE RN <= 100
+ORDER BY ORDER_AMT DESC, ORDER_NO;
+```
+
+### 실행계획 및 수행통계
+
+```text
+------------------------------------------------------------------------------------------------
+| Id | Operation                         | Name          | E-Rows | A-Rows  | Used-Tmp |
+------------------------------------------------------------------------------------------------
+|  0 | SELECT STATEMENT                  |               |        |     100 |          |
+|  1 |  SORT ORDER BY                    |               |    100 |     100 |          |
+|  2 |   VIEW                            |               |    100 |     100 |          |
+|  3 |    WINDOW SORT PUSHED RANK        |               | 120000 |     100 |     18GB |
+|  4 |     HASH JOIN                     |               | 120000 | 8000000 |          |
+|  5 |      HASH JOIN                    |               | 120000 | 8000000 |          |
+|  6 |       TABLE ACCESS BY INDEX ROWID | ORDER_TXN     | 120000 | 8000000 |          |
+|  7 |        INDEX RANGE SCAN           | ORDER_TXN_X01 | 120000 | 8000000 |          |
+|  8 |       TABLE ACCESS FULL           | CUSTOMER      |  5000K |   5000K |          |
+|  9 |      TABLE ACCESS FULL            | PRODUCT       |  1000K |   1000K |          |
+------------------------------------------------------------------------------------------------
+```
+
+```text
+Operation                 OMem    1Mem    Used-Mem    Used-Tmp
+WINDOW SORT PUSHED RANK   180MB   180MB   160MB       18GB
+```
+
+옵티마이저는 조회 대상 주문을 12만 건으로 예상했으나 실제 처리 건수는 800만 건이었다.
+
+### 문제
+
+현재 SQL과 실행통계를 분석하여 성능 저하의 주요 원인을 설명하고 SQL을 개선하시오.
+
+다음 두 가지 실행 전략을 모두 검토하고, 각 전략이 유리한 조건과 불리한 조건을 설명하시오.
+
+1. 기존 인덱스의 정렬 순서를 이용하여 별도의 대량 소트 없이 상위 100건을 조회하는 방안
+2. 조건에 해당하는 주문을 정렬해야 하는 경우 Workarea와 TEMP 사용량을 줄이는 방안
+
+필요하면 인덱스 변경안을 함께 제시할 수 있다. 단, 조회 기간과 지역별 데이터 분포가 달라질 때에도 동일한 개선안이 항상 유리한지는 별도로 판단하시오.
+
+**답변**
+
+- [[SQLP 스터디] 6주차 - 제5장 SQL 옵티마이저, 제6장 고급 SQL 튜닝 1 : Ⅹ.문제풀이 문제 1](https://blog.naver.com/biyoonx/224329298300)(링크변경예정)
+</details>
+</dd>
+</dl>
+</details>
 
 ---
 
