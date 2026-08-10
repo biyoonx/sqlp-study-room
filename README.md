@@ -4220,12 +4220,632 @@ WINDOW SORT PUSHED RANK   180MB   180MB   160MB       18GB
 
 ---
 
-### 7주차 : 제6장 고급 SQL 튜닝
+### 7주차 : 제6장 고급 SQL 튜닝(2026-08-08)
 #### 제2절 DML 튜닝
 #### 제3절 데이터베이스 Call 최소화
 #### 제4절 파티셔닝
 #### 제5절 대용량 배치 프로그램 튜닝
 #### 제6절 고급 SQL 활용
+
+<details>
+<summary>이지은🙋🏻‍♀️</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>Q. 대용량 진료이력 기반 월간 통계 적재 배치 분석 및 튜닝</summary>
+  
+  ### 업무 상황
+
+의료기관에서는 매월 초 전월 완료 진료를 기준으로 성별·연령대·진료과별 월간 통계정보를 생성한다.
+
+현재 배치 프로그램은 대상 환자를 먼저 조회한 후 환자별로 진료이력을 반복 조회하고, 계산한 결과를 통계 테이블에 한 건씩 적재한다.
+
+```
+대상 환자 조회
+    ↓
+환자별 반복 처리
+    ├─ 해당 월 진료이력 조회
+    ├─ 진료 건수 조회
+    ├─ 총진료비 조회
+    ├─ 최근 진료 조회
+    ├─ 통계 테이블 INSERT 또는 UPDATE
+    └─ COMMIT
+```
+
+최근 진료이력 데이터가 증가하면서 배치 수행시간이 6시간 이상 소요되고 있으며, 수행 중 log file sync, 높은 Execute Call, TEMP 사용량 증가가 확인되었다.
+
+### 데이터 규모
+
+`TB_TREATMENT`
+
+- 전체 진료이력: 120,000,000건
+- 월평균 진료이력: 10,000,000건
+- 완료 진료 비율: 약 90%
+- 월별 RANGE 파티션 구성
+
+`TB_PATIENT`
+
+- 전체 환자: 1,000,000명
+
+`TB_MONTHLY_TREATMENT_STAT`
+
+- 성별·연령대·진료과별 월간 통계 적재 테이블
+- 기준월 데이터를 월 1회 생성
+
+### 테이블 구성
+
+```sql
+CREATE TABLE TB_PATIENT
+(
+    PATIENT_ID  NUMBER        NOT NULL,
+    PATIENT_NM  VARCHAR2(100) NOT NULL,
+    SEX_CD      VARCHAR2(1)   NOT NULL,
+    BIRTH_DT    DATE          NOT NULL,
+    CONSTRAINT TB_PATIENT_PK PRIMARY KEY (PATIENT_ID)
+);
+```
+
+```sql
+CREATE TABLE TB_TREATMENT
+(
+    TREATMENT_ID       NUMBER       NOT NULL,
+    PATIENT_ID         NUMBER       NOT NULL,
+    TREATMENT_DTM      DATE         NOT NULL,
+    TREATMENT_STAT_CD  VARCHAR2(20) NOT NULL,
+    DEPT_CD            VARCHAR2(10) NOT NULL,
+    TREATMENT_COST     NUMBER       NOT NULL,
+    CONSTRAINT TB_TREATMENT_PK PRIMARY KEY (TREATMENT_ID)
+)
+PARTITION BY RANGE (TREATMENT_DTM)
+(
+    PARTITION P202606 VALUES LESS THAN (DATE '2026-07-01'),
+    PARTITION P202607 VALUES LESS THAN (DATE '2026-08-01'),
+    PARTITION P202608 VALUES LESS THAN (DATE '2026-09-01'),
+    PARTITION PMAX     VALUES LESS THAN (MAXVALUE)
+);
+```
+
+```sql
+CREATE INDEX TB_TREATMENT_X01
+    ON TB_TREATMENT (TREATMENT_DTM, PATIENT_ID)
+LOCAL;
+```
+
+```sql
+CREATE TABLE TB_MONTHLY_TREATMENT_STAT
+(
+    BASE_YYYYMM        VARCHAR2(6)  NOT NULL,
+    SEX_CD             VARCHAR2(1)  NOT NULL,
+    AGE_GROUP          VARCHAR2(10) NOT NULL,
+    DEPT_CD            VARCHAR2(10) NOT NULL,
+    PATIENT_CNT        NUMBER       NOT NULL,
+    TREATMENT_CNT      NUMBER       NOT NULL,
+    TOTAL_COST         NUMBER       NOT NULL,
+    LAST_TREATMENT_ID  NUMBER,
+    LAST_TREATMENT_DTM DATE
+);
+```
+
+### 기존 배치 통계
+
+1. 대상 환자 조회 - 1회
+2. 환자별 진료 조회 - 약 1,000,000회
+3. 환자별 집계 조회 - 약 1,000,000회
+4. 최근 진료 조회 - 약 1,000,000회
+5. 통계 테이블 DML - 약 1,000,000회
+6. COMMIT - 약 1,000,000회
+
+---
+
+#### 문제 1. 집합 기반 적재 SQL 작성
+
+기존 배치 프로그램은 환자별로 진료내역을 반복 조회하고, 계산한 통계 결과를 한 건씩 적재한다.
+
+이를 하나의 집합 기반 SQL로 개선한 경우 다음과 같은 주요 실행계획이 예상된다.
+
+```sql
+-----------------------------------------------------------------------------------
+| Id | Operation                       | Name                         |
+-----------------------------------------------------------------------------------
+|  0 | INSERT STATEMENT                |                              |
+|  1 |  LOAD AS SELECT                 | TB_MONTHLY_TREATMENT_STAT    |
+|  2 |   HASH GROUP BY                 |                              |
+|  3 |    HASH JOIN                    |                              |
+|  4 |     TABLE ACCESS FULL           | TB_PATIENT                   |
+|  5 |     PARTITION RANGE SINGLE      |                              |
+|  6 |      TABLE ACCESS FULL          | TB_TREATMENT                 |
+-----------------------------------------------------------------------------------
+```
+
+위 실행계획의 주요 처리 흐름이 나타나도록 2026년 7월 완료 진료에 대한 월간 통계 적재 SQL을 작성하시오.
+
+적재 항목은 다음과 같다.
+
+- 기준연월
+- 성별
+- 진료일 기준 10세 단위 연령대
+- 진료과
+- 고유 환자 수
+- 진료 건수
+- 총진료비
+- 그룹 내 가장 최근 진료번호
+- 그룹 내 가장 최근 진료일시
+
+동일한 진료일시에 여러 건이 존재하면 진료번호가 가장 큰 건을 최근 진료로 판단한다.
+
+다음 조건을 모두 만족해야 한다.
+
+- 환자별 반복 SQL과 건별 DML을 사용하지 않는다.
+- 조회와 적재를 하나의 `INSERT SELECT`로 처리한다.
+- 2026년 7월 파티션만 읽도록 조건을 작성한다.
+- 대량 적재에 적합하도록 Direct Path Insert를 고려한다.
+- 최근 진료정보는 별도의 분석 함수용 대량 정렬을 최소화하는 방식으로 산출한다.
+- 환자 수는 중복 환자를 제외하여 계산한다.
+
+작성한 SQL에서 `LOAD AS SELECT`, `HASH GROUP BY`, `HASH JOIN`, `PARTITION RANGE SINGLE`, `TABLE ACCESS FULL TB_TREATMENT`가 선택될 수 있는 이유를 설명하시오.
+
+---
+
+#### 문제 2. 파티션 프루닝과 조건식 작성
+
+`TB_TREATMENT`는 `TREATMENT_DTM`을 기준으로 월별 RANGE 파티셔닝되어 있다.
+
+2026년 7월 데이터만 조회할 때 다음 두 조건식의 파티션 접근 방식과 성능 차이를 설명하시오.
+
+```sql
+T.TREATMENT_DTM >= DATE '2026-07-01'
+AND T.TREATMENT_DTM <  DATE '2026-08-01'
+```
+
+```sql
+TO_CHAR(T.TREATMENT_DTM, 'YYYYMM') = '202607'
+```
+
+또한 다음 조건이 2026년 7월 전체 데이터를 정확히 조회하지 못하는 이유를 설명하시오.
+
+```sql
+T.TREATMENT_DTM BETWEEN DATE '2026-07-01'
+                    AND DATE '2026-07-31'
+```
+
+파티션 키를 가공하지 않은 범위 조건, 정적 파티션 프루닝, 로컬 인덱스 활용 및 대상 월 파티션 Full Scan 관점에서 설명한다.
+
+추가로 `TB_MONTHLY_TREATMENT_STAT`도 `BASE_YYYYMM` 기준 월별 파티셔닝되어 있다고 가정한다.
+
+기준월 통계를 전체 재생성할 때 다음 두 방식의 차이를 설명하고, 대용량 월간 배치에 더 적합한 방식을 판단하시오.
+
+```sql
+DELETE FROM TB_MONTHLY_TREATMENT_STAT
+WHERE BASE_YYYYMM = '202607';
+```
+
+```sql
+ALTER TABLE TB_MONTHLY_TREATMENT_STAT
+TRUNCATE PARTITION P202607;
+```
+
+Undo, Redo, 수행시간, 트랜잭션 제어 및 인덱스 관리 측면에서 비교한다.
+
+---
+
+#### 문제 3. DML 및 대용량 배치 튜닝
+
+문제 1의 적재 SQL에 `INSERT /*+ APPEND */ SELECT`를 적용하는 경우 일반적인 Conventional Insert와 비교하여 설명하시오.
+
+다음 내용을 포함한다.
+
+- Direct Path Insert
+- Buffer Cache 사용 차이
+- High Water Mark 이후 적재
+- Undo와 Redo 발생 특성
+- 대상 테이블 인덱스 유지 비용
+- Lock 및 동시성 제약
+- `NOLOGGING` 사용 시 복구상 주의사항
+
+또한 다음 세 가지 COMMIT 방식의 특징을 비교하고, 월간 통계 배치에 적합한 방식을 제시하시오.
+
+1. 건별 COMMIT
+2. 일정 처리 단위별 COMMIT
+3. 전체 적재 완료 후 COMMIT
+
+다음 관점에서 설명한다.
+
+- `log file sync`
+- Undo 사용량
+- 장애 시 재처리 범위
+- 데이터 정합성
+- 배치 재시작 가능성
+
+---
+
+#### 문제 4. 고급 SQL 방식 비교 및 최종 개선 효과
+
+가장 최근 진료정보를 산출하는 다음 두 방식을 비교하시오.
+
+```sql
+ROW_NUMBER() OVER
+(
+    PARTITION BY ...
+    ORDER BY TREATMENT_DTM DESC,
+             TREATMENT_ID DESC
+)
+```
+
+```sql
+MAX(TREATMENT_ID)
+KEEP
+(
+    DENSE_RANK LAST
+    ORDER BY TREATMENT_DTM,
+             TREATMENT_ID
+)
+```
+
+두 방식의 실행 특성을 `WINDOW SORT`, `HASH GROUP BY`, 중간 결과 건수 및 TEMP 사용 측면에서 비교하고, 대용량 월간 집계 배치에서는 어느 방식이 더 적합한지 그 이유를 설명하시오.
+
+또한 최근 진료번호와 최근 진료일시를 각각 집계할 경우 서로 다른 진료행의 값이 조합되지 않도록 데이터 정합성을 보장하는 방법을 설명하시오.
+
+마지막으로 앞선 문제에서 검토한 집합 처리, 파티션 프루닝, Direct Path Insert 및 COMMIT 전략을 기존 배치 프로그램에 적용했을 때 기대되는 전체적인 성능 개선 효과를 Database Call, 파티션 접근, DML 및 트랜잭션 처리 관점에서 설명하시오.
+
+**답변**
+
+- [https://app.notion.com/p/leeeden/7-6-SQL-3b470b7b39f48079a3acd21c9d52c6c8?source=copy_link](https://app.notion.com/p/leeeden/7-6-SQL-3b470b7b39f48079a3acd21c9d52c6c8?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - 추가 예정
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>DML·파티션·배치 튜닝</summary>
+  
+  ### 문제 1. 대량 월별 이력 데이터 적재
+
+#### 업무 상황
+
+인사 시스템에서는 매월 말 기준으로 재직자 정보를 월별 이력 테이블에 저장한다.
+
+#### `EMP_BIG`
+
+* 전체 데이터 약 3,000만 건
+* 현재 재직자는 약 1,200만 명
+* `RETIRE_YN = 'N'`인 사원을 월별 이력 대상으로 적재함
+
+#### `EMP_MONTHLY_SNAPSHOT`
+
+* 월별 사원 현황 보관 테이블
+* 기존 데이터 약 1억 건
+* 매월 약 1,200만 건씩 추가됨
+* 비고유 B-Tree 보조 인덱스 4개 존재
+* 배치 수행 시간에는 해당 테이블을 조회하거나 변경하는 다른 업무가 없음
+* 트리거 및 참조 무결성 제약조건은 없음
+* 인덱스 재생성을 위한 추가 작업 공간은 충분함
+* 배치 완료 후 데이터베이스 백업을 수행함
+
+현재 다음 SQL을 수행하고 있다.
+
+```sql
+INSERT INTO EMP_MONTHLY_SNAPSHOT
+(
+    SNAPSHOT_YM,
+    EMPNO,
+    ENAME,
+    DEPTNO,
+    JOB,
+    SAL,
+    HIREDATE
+)
+SELECT
+    :SNAPSHOT_YM,
+    EMPNO,
+    ENAME,
+    DEPTNO,
+    JOB,
+    SAL,
+    HIREDATE
+FROM EMP_BIG
+WHERE RETIRE_YN = 'N';
+```
+
+최근 데이터 증가로 배치 수행 시간이 길어지고 있으며 대량의 Redo 로그가 발생하고 있다.
+
+#### 작성 요구사항
+
+1. 현재 INSERT 방식의 성능 부하가 발생하는 원인을 설명하시오.
+2. 대량 데이터 적재 시간을 단축하고 Redo 로그 발생량을 줄일 수 있도록 SQL 및 작업 절차를 개선하시오.
+3. 보조 인덱스를 유지하면서 적재하는 방법과 적재 전 제거 후 재생성하는 방법을 비교하고, 주어진 조건에서 적절한 처리 방법을 제시하시오.
+4. 제시한 방법을 운영 환경에 적용할 때 확인해야 할 사항을 작성하시오.
+
+---
+
+### 문제 2. 월 파티션 데이터 대량 삭제
+
+#### 업무 상황
+
+접속 로그 테이블은 접속 일시를 기준으로 월별 Range Partitioning되어 있다.
+
+#### `LOGIN_ACCESS_LOG`
+
+```sql
+CREATE TABLE LOGIN_ACCESS_LOG
+(
+    LOG_ID          NUMBER        NOT NULL,
+    MEMBER_ID       NUMBER        NOT NULL,
+    ACCESS_DTM      DATE          NOT NULL,
+    ACCESS_IP       VARCHAR2(50)  NOT NULL,
+    ACCESS_RESULT   VARCHAR2(2)   NOT NULL,
+    DEVICE_TYPE     VARCHAR2(20),
+    CONSTRAINT LOGIN_ACCESS_LOG_PK
+        PRIMARY KEY (LOG_ID)
+)
+PARTITION BY RANGE (ACCESS_DTM)
+(
+    PARTITION P_BEFORE_2026
+        VALUES LESS THAN (DATE '2026-01-01'),
+
+    PARTITION P202601
+        VALUES LESS THAN (DATE '2026-02-01'),
+
+    PARTITION P202602
+        VALUES LESS THAN (DATE '2026-03-01'),
+
+    PARTITION P202603
+        VALUES LESS THAN (DATE '2026-04-01'),
+
+    PARTITION P_MAX
+        VALUES LESS THAN (MAXVALUE)
+);
+```
+
+#### 데이터 및 인덱스 특성
+
+* 전체 데이터 약 15억 건
+* `P202601` 파티션에 약 1억 건 존재
+* `ACCESS_RESULT = '99'`는 테스트 및 비정상 수집 데이터
+* `P202601` 데이터 중 약 95%가 `ACCESS_RESULT = '99'`
+* 나머지 정상 데이터 약 5%는 계속 보관해야 함
+* `ACCESS_DTM, MEMBER_ID` 기준 로컬 파티션 인덱스 존재
+* `MEMBER_ID, ACCESS_DTM` 기준 글로벌 비파티션 인덱스 존재
+* 기본키 인덱스도 글로벌 인덱스로 구성되어 있음
+* 작업 시간에는 `P202601` 데이터에 대한 업무를 중단할 수 있음
+* 임시 데이터 저장을 위한 별도 공간은 충분함
+
+현재 다음과 같이 삭제하려고 한다.
+
+```sql
+DELETE FROM LOGIN_ACCESS_LOG PARTITION (P202601)
+WHERE ACCESS_RESULT = '99';
+```
+
+#### 작성 요구사항
+
+1. 현재 DELETE 방식을 그대로 수행할 경우 발생할 수 있는 성능 문제를 설명하시오.
+2. 삭제 대상 95%를 직접 제거하는 대신 보관 대상 5%를 기준으로 처리하도록 전체 작업 절차와 필요한 SQL을 작성하시오.
+3. 작업 과정에서 Undo·Redo 발생량을 최소화할 수 있는 방법을 함께 적용하시오.
+4. 파티션 작업이 로컬 인덱스와 글로벌 인덱스에 미치는 영향을 구분하여 설명하고 필요한 후속 작업을 작성하시오.
+5. 반대로 삭제 대상이 파티션 전체 데이터의 약 5%뿐이라면 동일한 방법을 사용할 것인지 판단하고 그 이유를 작성하시오.
+
+---
+
+### 문제 3. 대량 급여 계산 배치
+
+#### 업무 상황
+
+급여 시스템에서는 매월 전체 재직자의 급여를 계산하여 월별 급여 결과 테이블에 저장한다.
+
+#### `EMP_BIG`
+
+* 재직자 약 500만 명
+* 배치 시작 시 처리 대상 사원 Cursor를 생성함
+
+#### `EMP_SAL_RESULT`
+
+* 월별 급여 계산 결과 테이블
+* 사원별·급여월별 1건 저장
+* `(PAY_YM, EMPNO)` 조합의 고유성이 보장됨
+
+급여 금액 계산에는 사원정보뿐 아니라 외부 인사규정 모듈과 애플리케이션 로직이 사용되므로 전체 작업을 하나의 `INSERT ... SELECT` SQL로 변경할 수 없다.
+
+배치 프로그램은 Java/JDBC로 작성되어 있으며 현재 다음 방식으로 수행된다.
+
+```text
+JDBC Fetch Size = 1로 사원 1건 Fetch
+        ↓
+애플리케이션에서 급여 계산
+        ↓
+EMP_SAL_RESULT에 1건씩 개별 INSERT 실행
+        ↓
+COMMIT
+        ↓
+다음 사원 처리
+```
+
+500만 명을 처리하면서 배치 수행 시간이 지나치게 길어지고 있다.
+
+한편 모든 데이터를 한 번에 하나의 트랜잭션으로 처리할 경우에는 장애 발생 시 재처리 범위와 트랜잭션 크기가 지나치게 커질 수 있다.
+
+#### 작성 요구사항
+
+1. 현재 프로그램이 느린 원인을 데이터베이스 Call 및 COMMIT 관점에서 설명하시오.
+2. 조회 과정의 Fetch 방식과 결과 INSERT 방식을 개선하여 한 번의 데이터베이스 Call로 여러 건을 처리할 수 있도록 배치 구조를 설계하시오.
+3. COMMIT 단위를 결정할 때 고려해야 할 사항을 작성하고, 행마다 COMMIT하는 방식과 전체 500만 건을 한 번에 COMMIT하는 방식의 문제점을 각각 설명하시오.
+4. 배치 도중 장애가 발생한 경우 이미 처리한 구간부터 안전하게 재개할 수 있도록 재처리 방안을 설계하시오.
+5. 변경 전과 변경 후의 전체 처리 흐름을 비교하여 작성하시오.
+
+**답변**
+
+- 추가 예정
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>A 사업 지원금 관리 시스템 - Raw Data 배치 튜닝</summary>
+  
+  ### 업무 상황
+
+A 사업 지원금 관리 시스템에서는 신청 → 접수 → 지원 → 청구로 이어지는 4단계 업무 데이터를 하나의 Raw Data 테이블로 매일 새벽 배치를 통해 관리한다.
+
+각 테이블은 계층적 PK 구조를 가진다.
+
+```
+신청 테이블 : 신청PK
+접수 테이블 : 신청PK, 접수PK
+지원 테이블 : 신청PK, 접수PK, 지원PK
+청구 테이블 : 신청PK, 접수PK, 지원PK, 청구PK
+```
+
+데이터가 지속적으로 증가하면서 배치 수행 시간과 트랜잭션 부하가 문제가 되기 시작했다.
+
+### 데이터 특성
+
+```
+신청 테이블 : 약 3,000만 건
+접수 테이블 : 약 2,000만 건 (신청 대비 약 67% 접수)
+지원 테이블 : 약 1,300만 건 (접수 대비 약 65% 지원)
+청구 테이블 : 약 700만 건  (지원 대비 약 54% 청구)
+
+각 테이블은 수정일시(UPD_DTM) 컬럼을 보유하며
+전일 변경(신규 생성 포함) 건수는 일평균 약 3만 건 수준이다.
+
+RAW_DATA 테이블 : 전체 누적 약 700만 건
+(청구 테이블 기준 4단계 조인 결과와 1:1 대응)
+현재 비파티션 Heap Table이며
+신청일자(APPLY_DT) 컬럼을 보유한다.
+```
+
+### 현재 배치 처리 방식
+
+```
+1. 4개 테이블에서 각각
+   수정일시(UPD_DTM) >= 전일 00:00:00 조건으로
+   전일 변경분만 인라인뷰로 먼저 필터링
+
+2. 필터링된 결과를 신청→접수→지원→청구 순으로
+   단계적으로 조인하여 변경 대상 RAW_DATA 후보군 생성
+   (일평균 약 3만 건)
+
+3. 생성된 결과의 PK(신청PK+접수PK+지원PK+청구PK)를 기준으로
+   RAW_DATA 테이블에서 기존 데이터를 DELETE
+
+4. 새로 생성한 결과를 RAW_DATA 테이블에 INSERT
+
+5. 배치는 3만 건 단위 전체를
+   하나의 트랜잭션으로 처리 후 COMMIT
+```
+
+### 현재 SQL
+
+```sql
+-- STEP 1. 전일 변경분 조회 (인라인뷰 조인)
+CREATE OR REPLACE VIEW V_CHANGED_RAW AS
+SELECT A.신청PK, B.접수PK, C.지원PK, D.청구PK,
+       A.신청일자, B.접수일자, C.지원일자, D.청구일자,
+       D.청구금액
+FROM (SELECT * FROM 신청 WHERE UPD_DTM >= TRUNC(SYSDATE-1)) A,
+     (SELECT * FROM 접수 WHERE UPD_DTM >= TRUNC(SYSDATE-1)) B,
+     (SELECT * FROM 지원 WHERE UPD_DTM >= TRUNC(SYSDATE-1)) C,
+     (SELECT * FROM 청구 WHERE UPD_DTM >= TRUNC(SYSDATE-1)) D
+WHERE A.신청PK = B.신청PK
+AND   B.신청PK = C.신청PK AND B.접수PK = C.접수PK
+AND   C.신청PK = D.신청PK AND C.접수PK = D.접수PK AND C.지원PK = D.지원PK;
+
+-- STEP 2. 기존 데이터 삭제
+DELETE FROM RAW_DATA
+WHERE (신청PK, 접수PK, 지원PK, 청구PK) IN (
+    SELECT 신청PK, 접수PK, 지원PK, 청구PK FROM V_CHANGED_RAW
+);
+
+-- STEP 3. 신규 데이터 삽입
+INSERT INTO RAW_DATA
+SELECT * FROM V_CHANGED_RAW;
+
+COMMIT;
+```
+
+---
+
+### 문제 1. [DML 튜닝] DELETE + INSERT vs MERGE 비교
+
+1) 현재 DELETE + INSERT 방식의 성능 부하 요인
+
+2) 위 로직을 MERGE 문 하나로 통합했을 때의 SQL을 작성하고, DELETE+INSERT 방식과 비교
+
+3) 현재 배치는 "변경분 전체 삭제 후 전체 삽입" 방식이다. 만약 실제로는 삭제 대상이 없고 신규 삽입 대상만 있는 경우(순수 신규 신청 건)에도 DELETE 문이 함께 수행된다. 이로 인한 불필요한 비용을 설명하고, 개선 방향을 제시하시오.
+
+---
+
+### 문제 2. [파티셔닝] RAW_DATA 테이블 파티셔닝 도입 검토
+
+RAW_DATA 테이블이 700만 건 규모로 증가하면서, 매일 3만 건씩 DELETE + INSERT를 반복하는 현재 방식의 부하가 누적되고 있다. 담당자는 RAW_DATA 테이블에 파티셔닝 도입을 검토하고 있다.
+
+```sql
+-- 파티셔닝 도입 검토안
+CREATE TABLE RAW_DATA_NEW
+(
+    신청PK    NUMBER  NOT NULL,
+    접수PK    NUMBER  NOT NULL,
+    지원PK    NUMBER  NOT NULL,
+    청구PK    NUMBER  NOT NULL,
+    신청일자   DATE    NOT NULL,
+    접수일자   DATE,
+    지원일자   DATE,
+    청구일자   DATE,
+    청구금액   NUMBER
+)
+PARTITION BY RANGE (신청일자)
+(
+    PARTITION P_BEFORE VALUES LESS THAN (DATE '2026-01-01'),
+    PARTITION P202601  VALUES LESS THAN (DATE '2026-02-01'),
+    PARTITION P202602  VALUES LESS THAN (DATE '2026-03-01'),
+    PARTITION P_MAX    VALUES LESS THAN (MAXVALUE)
+);
+```
+
+1) 신청일자를 파티션 키로 선택하는 것이 적절한지 판단하시오.
+2) 신청일자 대신 배치처리일자를 파티션 키로 사용하면 이 문제가 해결되는지 판단하시오.
+3) 2)의 분석을 바탕으로, 이 RAW_DATA 배치 구조에서 파티셔닝이 DELETE 성능 개선에 실질적으로 기여하기 어려운 근본적인 이유를 설명하시오.
+
+---
+
+### 문제 3. [대용량 배치 튜닝] Direct Path Insert와 COMMIT 전략
+
+현재 배치는 DELETE와 INSERT를 하나의 트랜잭션으로 묶어 3만 건 단위 전체를 처리한 후 한 번에 COMMIT하고 있다.
+
+1) 현재 INSERT 문에 `/*+ APPEND */` 힌트를 적용할 수 있는지 판단하시오. 같은 트랜잭션 내에서 직전에 DELETE가 수행되었다는 점을 고려하여 Direct Path Insert 적용 가능 여부와 제약사항을 설명하시오.
+
+2) 만약 DELETE와 INSERT를 완전히 분리된 두 트랜잭션(각각 별도 COMMIT)으로 처리한다면, Direct Path Insert 적용 가능 여부가 어떻게 달라지는지 설명하시오. 이때 발생할 수 있는 데이터 정합성 문제(트랜잭션 분리로 인한)도 함께 설명하시오.
+
+3) 현재처럼 3만 건 전체를 하나의 트랜잭션으로 처리하는 방식과, 예를 들어 5천 건 단위로 나누어 여러 번 COMMIT하는 방식 비교
+
+4) 이 배치가 매일 새벽 시간대에 단독으로 수행되며 RAW_DATA 테이블을 조회하는 다른 프로세스가 없다는 조건이 주어진다면, 위 3)의 비교 결과가 어떻게 달라지는지 설명하시오.
+
+**답변**
+
+- [[SQLP] 6장(2) 문제와 풀이](https://app.notion.com/p/SQLP-6-2-3b6894b3ff32807182d1e64bd8a35a7f?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
 
 ---
 
