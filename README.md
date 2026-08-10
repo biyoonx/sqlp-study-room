@@ -4502,7 +4502,7 @@ KEEP
   <summary>이시향🙋🏻‍♀️</summary>
   
   - [x] 주제 핵심 및 문제풀이 전략
-  - 추가 예정
+  - [[SQLP 스터디] 7주차 - 제6장 고급 SQL 튜닝 2-6 : Ⅰ-Ⅸ](https://blog.naver.com/biyoonx/224374512771)
   - [x] 주제에 대한 서술형 문제 및 풀이 공유
 
 <dl>
@@ -4685,7 +4685,7 @@ COMMIT
 
 **답변**
 
-- 추가 예정
+- [[SQLP 스터디] 7주차 - 제6장 고급 SQL 튜닝 2-6 : Ⅹ.문제풀이](https://blog.naver.com/biyoonx/224374512771)
 </details>
 </dd>
 </dl>
