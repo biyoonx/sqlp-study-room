@@ -4849,8 +4849,483 @@ PARTITION BY RANGE (신청일자)
 
 ---
 
-### 8주차 : 제7장 Lock과 트랜잭션 동시성 제어
+### 8주차 : 제7장 Lock과 트랜잭션 동시성 제어(2026-08-16)
 #### 제1절 Lock
 #### 제2절 트랜잭션
 #### 제3절 동시성 제어
 
+<details>
+  <summary>최수연🙋🏻‍♀️</summary>
+
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>[동시성 제어] 재고 차감 - Lost Update와 해결 방안 + 기출 응용 2문제</summary>
+  
+  ### 문제 1. [동시성 제어] 재고 차감 - Lost Update와 해결 방안
+
+#### 테이블 구성
+
+```sql
+CREATE TABLE PRODUCT_STOCK
+(
+    PRODUCT_ID  NUMBER      NOT NULL,
+    STOCK_QTY   NUMBER      NOT NULL,
+    VERSION_NO  NUMBER      DEFAULT 0 NOT NULL,
+    CONSTRAINT PRODUCT_STOCK_PK PRIMARY KEY (PRODUCT_ID)
+);
+
+INSERT INTO PRODUCT_STOCK VALUES (1001, 10, 0);
+COMMIT;
+```
+
+#### 상황
+
+```
+특정 인기 상품(PRODUCT_ID=1001)의 재고가 1개 남은 상태에서
+세션 A와 세션 B가 거의 동시에 같은 상품을 1개씩 주문하는 상황이 발생했다.
+```
+
+#### [방식 1] 단순 UPDATE
+
+```sql
+-- 세션 A, 세션 B 모두 동일하게 수행
+UPDATE PRODUCT_STOCK
+SET STOCK_QTY = STOCK_QTY - 1
+WHERE PRODUCT_ID = 1001;
+
+COMMIT;
+```
+
+#### [방식 2] 애플리케이션에서 재고 확인 후 처리
+
+```sql
+-- STEP 1. 애플리케이션이 현재 재고를 조회
+SELECT STOCK_QTY FROM PRODUCT_STOCK WHERE PRODUCT_ID = 1001;
+
+-- STEP 2. 계산된 값으로 UPDATE
+UPDATE PRODUCT_STOCK
+SET STOCK_QTY = :계산된값
+WHERE PRODUCT_ID = 1001;
+
+COMMIT;
+```
+
+#### 문제
+
+1. [방식 1]에서는 세션 A와 세션 B가 동시에 실행되더라도 `Lost Update`(갱신 유실)가 발생하지 않는다. 그 이유를 UPDATE 문의 Lock 획득 방식과 연관지어 설명하시오.
+2. [방식 2]에서는 `Lost Update`가 발생할 수 있다. 세션 A와 세션 B의 STEP 1, STEP 2 실행 순서를 시간 순서대로 나열하여 최종 재고가 잘못 계산되는 과정을 설명하시오.
+3. [방식 2]의 문제를 비관적 동시성 제어로 해결하는 SQL을 작성하고, 이 방식이 Lost Update를 방지할 수 있는 원리를 설명하시오.
+4. [방식 2]의 문제를 낙관적 동시성 제어로 해결하는 SQL을 `VERSION_NO` 컬럼을 활용하여 작성하고, 비관적 동시성 제어와 비교했을 때의 장단점을 설명하시오.
+5. 동시 주문이 몰려 재고가 0 미만으로 차감되는 초과 판매(Overselling)를 방지하기 위해 UPDATE 문에 추가해야 할 조건을 작성하고, 이 조건이 비관적/낙관적 동시성 제어 각각에서 어떻게 함께 적용되어야 하는지 설명하시오.
+
+---
+
+### 문제 2. [기출 응용] UPDATE + 스칼라서브쿼리 + OR + EXISTS 튜닝
+
+#### 환경구성
+
+```sql
+DROP TABLE T1;
+CREATE TABLE T1 AS
+SELECT 
+	10000+ROWNUM C1
+	, ROWNUM C2
+	, 10000-ROWNUM C3
+	, 123 C4
+	, 123 C5
+FROM DUAL 
+CONNECT BY LEVEL <= 10000;
+
+DROP TABLE T2 ;
+CREATE TABLE T2 AS
+SELECT 
+	CASE WHEN MOD(C2, 2) = 0 THEN C2 END C1
+	, CASE WHEN MOD(C2, 2) = 1 THEN C3 END C2
+	, TRUNC(DBMS_RANDOM.VALUE(1, 100)) C3
+	, TRUNC(DBMS_RANDOM.VALUE(101, 200)) C4
+FROM T1, (SELECT LEVEL LVL FROM DUAL CONNECT BY LEVEL <= 10) D
+;
+
+DROP TABLE T3 ;
+CREATE TABLE T3 AS
+SELECT 
+	ROWNUM C1
+	, 124 C2
+FROM DUAL 
+CONNECT BY LEVEL <= 1000;
+
+DROP INDEX T2_X1;
+CREATE INDEX T2_X1 ON T2(C1);
+
+DROP INDEX T2_X2;
+CREATE INDEX T2_X2 ON T2(C2);
+```
+
+#### 문제
+
+```
+T1 컬럼 : C1, C2, C3, C4, C5
+T2 컬럼 : C1, C2, C3, C4
+T3 컬럼 : C1, C2
+
+-> 인덱스 : T2 : T2_X1(C1), T2_X2(C2)
+```
+
+아래 SQL을 튜닝하여 얻은 실행계획이 아래의 실행계획이다.
+아래의 실행계획과 같이 튜닝 하세요.
+
+```sql
+-----------------------------------------------------------------
+| Id | Operation                               | Name           |
+-----------------------------------------------------------------
+|  0 | UPDATE STATEMENT                        |                |
+|  1 |  UPDATE                                 | T1             |
+|* 2 |   HASH JOIN RIGHT SEMI                  |                |
+|  3 |    TABLE ACCESS FULL                    | T3             |
+|  4 |    TABLE ACCESS FULL                    | T1             |
+|  5 |   SORT AGGREGATE                        |                |
+|  6 |    VIEW                                 | VW_ORE_AE9E49E8|
+|  7 |     UNION-ALL                           |                |
+|  8 |      TABLE ACCESS BY INDEX ROWID BATCHED| T2             |
+|* 9 |       INDEX RANGE SCAN                  | T2_X1          |
+|*10 |      TABLE ACCESS BY INDEX ROWID BATCHED| T2             |
+|*11 |       INDEX RANGE SCAN                  | T2_X2          |
+-----------------------------------------------------------------
+```
+
+```sql
+UPDATE T1 A
+SET A.C4 = (SELECT MAX(C3) FROM T2 x WHERE X.C1 = A.C2 OR X.C2=A.C3)
+	, A.C5 = (SELECT MAX(C4) FROM T2 x WHERE X.C1 = A.C2 OR X.C2=A.C3)
+WHERE EXISTS (
+				SELECT 1
+				FROM T3 X
+				WHERE X.C1= A.C2
+					AND ROWNUM = 1
+			);
+
+COMMIT;
+```
+
+---
+
+### 문제 3. [기출 응용] INSERT + 병렬 + 인덱스 UNUSABLE 튜닝
+
+#### 환경구성
+
+```sql
+DROP TABLE T_SRC;
+CREATE TABLE T_SRC
+( C1 NUMBER
+, C2 VARCHAR2(10)
+, C3 NUMBER
+);
+
+DROP TABLE T_TGT;
+CREATE TABLE T_TGT
+( C1 NUMBER
+, C2 VARCHAR2(10)
+, C3 NUMBER
+);
+
+CREATE INDEX TGT_X1 ON T_TGT(C1);
+
+INSERT INTO T_SRC
+SELECT ROWNUM C1, NULL C2, 100000-ROWNUM C3
+FROM DUAL
+CONNECT BY LEVEL <= 100000
+;
+
+COMMIT;
+```
+
+#### 문제
+
+```
+T_SRC 테이블
+( C1 NUMBER
+, C2 VARCHAR2(10)
+, C3 NUMBER
+);
+
+T_TGT 테이블
+( C1 NUMBER
+, C2 VARCHAR2(10)
+, C3 NUMBER
+);
+
+인덱스 TGT_X1 : C1
+```
+
+아래 실행계획은 SQL을 튜닝한 결과의 실행계획입니다.
+아래에서 제시된 실행계획과 같이 튜닝하세요.
+- NOLOGGING 안해도 됨
+- 병렬도 그대로 2 활용
+
+```sql
+----------------------------------------------------------------------------------------
+| Id | Operation                               | Name   | TQ     | IN-OUT | PQ Distrib |
+----------------------------------------------------------------------------------------
+|  0 | INSERT STATEMENT                        |        |        |        |            |
+|  1 |  PX COORDINATOR                         |        |        |        |            |
+|  2 |   PX SEND QC (RANDOM)                   |:TQ10001| Q1,01  | P->S   | QC (RAND)  |
+|  3 |    MULTI-TABLE INSERT                   |        | Q1,01  | PCWP   |            |
+|  4 |     PX RECEIVE                          |        | Q1,01  | PCWP   |            |
+|  5 |      PX SEND ROUND-ROBIN                |:TQ10000| Q1,00  | P->P   | RND-ROBIN  |
+|  6 |       PX BLOCK ITERATOR                 |        | Q1,00  | PCWC   |            |
+|  7 |        TABLE ACCESS FULL                | T_SRC  | Q1,00  | PCWP   |            |
+|  8 |     DIRECT LOAD INTO (HYBRID TSM/HWMB)  | T_TGT  | Q1,01  | PCWP   |            |
+|  9 |     DIRECT LOAD INTO (HYBRID TSM/HWMB)  | T_TGT  | Q1,01  | PCWP   |            |
+----------------------------------------------------------------------------------------
+```
+
+```sql
+DELETE FROM T_TGT;
+COMMIT;
+
+INSERT /*+ APPEND PARALLEL(T_TGT 2) */ INTO T_TGT
+SELECT C1, 'A', C3 FROM T_SRC
+UNION ALL
+SELECT C1, 'B', C3 FROM T_SRC;
+
+COMMIT;
+```
+
+---
+
+문제2 출처 : [SQLP 54회 1번 복기](https://cafe.naver.com/dbstudydapsqlp/10550)
+문제3 출처 : [SQLP 54회 2번 복기](https://cafe.naver.com/dbstudydapsqlp/10551)
+
+**답변**
+
+- [[SQLP] 7장 문제와 풀이](https://app.notion.com/p/SQLP-7-3bd894b3ff328029a4a7d201e55765c3?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+<summary>이지은🙋🏻‍♀️</summary>
+
+- [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>Q. 동시 예약 처리 후 발생한 데이터 불일치 + 장시간 통계 조회 중 발생한 조회 일관성 문제</summary>
+  
+  ## Q.
+
+병원 검사 예약 시스템에서는 검사 슬롯별 예약 가능 인원을 관리하고 있으며, 예약 완료 후 검사 결과를 외부 시스템으로 전송한다.
+
+```sql
+CREATE TABLE TB_EXAM_SLOT
+(
+    SLOT_ID          NUMBER       NOT NULL,
+    EXAM_DT          DATE         NOT NULL,
+    CAPACITY         NUMBER       NOT NULL,
+    RESERVED_CNT     NUMBER       NOT NULL,
+    SLOT_STATUS      VARCHAR2(20) NOT NULL,
+    CONSTRAINT TB_EXAM_SLOT_PK PRIMARY KEY (SLOT_ID)
+);
+
+CREATE TABLE TB_RESERVATION
+(
+    RESERVATION_ID      NUMBER       NOT NULL,
+    SLOT_ID             NUMBER       NOT NULL,
+    PATIENT_ID          NUMBER       NOT NULL,
+    RESERVATION_STATUS  VARCHAR2(20) NOT NULL,
+    CONSTRAINT TB_RESERVATION_PK PRIMARY KEY (RESERVATION_ID)
+);
+
+CREATE TABLE TB_RESULT_QUEUE
+(
+    QUEUE_ID       NUMBER       NOT NULL,
+    RESERVATION_ID NUMBER       NOT NULL,
+    STATUS_CD      VARCHAR2(20) NOT NULL,
+    CREATED_DTM    DATE         NOT NULL,
+    CONSTRAINT TB_RESULT_QUEUE_PK PRIMARY KEY (QUEUE_ID)
+);
+```
+
+---
+
+#### 문제 1. 동시 예약 처리 후 발생한 데이터 불일치
+
+특정 검사 슬롯의 현재 상태는 다음과 같다.
+
+```
+SLOT_ID       = 500
+CAPACITY      = 100
+RESERVED_CNT  = 98
+SLOT_STATUS   = 'OPEN'
+```
+
+현재 프로그램은 예약 인원을 조회한 후 애플리케이션에서 값을 증가시킨다.
+
+```sql
+SELECT CAPACITY, RESERVED_CNT
+FROM   TB_EXAM_SLOT
+WHERE  SLOT_ID = :slot_id;
+
+UPDATE TB_EXAM_SLOT
+SET    RESERVED_CNT = :new_cnt
+WHERE  SLOT_ID = :slot_id;
+```
+
+동일 검사 슬롯에 두 건의 예약 요청이 거의 동시에 발생했으며 두 요청은 모두 성공으로 처리되었으나 최종 `RESERVED_CNT`는 99였다.
+
+다음 세 개선안 중 **동시 요청이 많은 예약 업무에 가장 적합한 방식을 선정하여 SQL을 완성하고**, 기존 방식에서 데이터 불일치가 발생한 원인과 다른 두 개선안보다 해당 방식을 선택한 이유를 동시성 및 Lock 범위 관점에서 설명하시오.
+
+**개선안**
+
+```sql
+-- A
+SELECT ...
+FOR UPDATE;
+
+-- B
+UPDATE TB_EXAM_SLOT
+SET RESERVED_CNT = RESERVED_CNT + 1
+WHERE ...;
+
+-- C
+UPDATE TB_EXAM_SLOT
+SET RESERVED_CNT = :new_cnt
+WHERE SLOT_ID = :slot_id
+AND   RESERVED_CNT = :old_cnt;
+```
+
+---
+
+#### 문제 2. 장시간 통계 조회 중 발생한 조회 일관성 문제
+
+병원 운영팀에서는 실시간 예약 현황을 확인하기 위해 다음 SQL을 실행한다.
+
+```sql
+SELECT SLOT_STATUS,
+       COUNT(*)          AS SLOT_CNT,
+       SUM(RESERVED_CNT) AS RESERVED_CNT
+FROM   TB_EXAM_SLOT
+GROUP BY SLOT_STATUS;
+```
+
+`TB_EXAM_SLOT`은 약 3천만 건이며, 해당 SQL은 전체 테이블을 읽어 약 8분 동안 수행된다.
+
+한편 예약 서비스는 통계 조회와 관계없이 계속 운영되고 있으며, 조회 수행 중 다른 세션에서 `TB_EXAM_SLOT`의 예약 인원을 지속적으로 변경하고 COMMIT한다.
+
+```sql
+UPDATE TB_EXAM_SLOT
+SET    RESERVED_CNT = RESERVED_CNT + 1
+WHERE  SLOT_ID = :slot_id;
+
+COMMIT;
+```
+
+특정 시점의 수행 상황은 다음과 같다.
+
+```
+시간      통계 조회 Session A                  예약 Session B
+--------------------------------------------------------------------
+T1        통계 SQL 실행 시작
+
+T2                                             SLOT 100 RESERVED_CNT 변경
+T3                                             COMMIT
+
+T4                                             SLOT 200 RESERVED_CNT 변경
+T5                                             COMMIT
+
+T6        아직 통계 SQL 수행 중
+
+T7                                             SLOT 300 RESERVED_CNT 변경
+T8                                             COMMIT
+
+T9        통계 SQL 종료
+```
+
+운영팀에서는 다음과 같은 두 가지 의문을 제기하였다.
+
+- 통계 SQL이 8분 동안 수행되는 사이 여러 예약이 COMMIT되었는데, 최종 집계 결과에 변경 전 값과 변경 후 값이 섞여 들어가는 것은 아닌가?
+- 같은 SQL이 평소에는 정상 수행되지만 특정 시간대에는 간헐적으로 `ORA-01555: snapshot too old`가 발생하는 이유는 무엇인가?
+
+**위 현상을 Oracle의 다중 버전 동시성 제어와 읽기 일관성 관점에서 분석하고, 장시간 조회와 빈번한 갱신이 동시에 발생하는 환경에서 `ORA-01555` 발생 가능성을 낮추기 위한 개선 방향을 제시하시오.**
+
+---
+
+#### 문제 3. 간헐적 Deadlock
+
+예약 취소를 수행하는 두 프로그램이 있다.
+
+**온라인 프로그램**
+
+```sql
+UPDATE TB_RESERVATION
+SET    RESERVATION_STATUS = 'CANCELLED'
+WHERE  RESERVATION_ID = :reservation_id;
+
+UPDATE TB_EXAM_SLOT
+SET    RESERVED_CNT = RESERVED_CNT - 1
+WHERE  SLOT_ID = :slot_id;
+
+COMMIT;
+```
+
+**야간 배치**
+
+```sql
+UPDATE TB_EXAM_SLOT
+SET    RESERVED_CNT = RESERVED_CNT - 1
+WHERE  SLOT_ID = :slot_id;
+
+UPDATE TB_RESERVATION
+SET    RESERVATION_STATUS = 'CANCELLED'
+WHERE  RESERVATION_ID = :reservation_id;
+
+COMMIT;
+```
+
+개별 테스트에서는 문제가 없었지만 두 프로그램이 동시에 실행되는 시간대에 간헐적으로 다음 오류가 발생한다.
+
+```
+ORA-00060: deadlock detected while waiting for resource
+```
+
+운영팀에서는 해결책으로 다음 두 방안을 검토하고 있다.
+
+1. 두 프로그램의 테이블 접근 순서를 동일하게 변경
+2. 각 UPDATE 직후 COMMIT하여 Lock을 즉시 해제
+
+**장애 발생 원인을 분석하고 두 개선안의 적절성을 평가한 후, 업무 정합성을 유지하면서 Deadlock 발생 가능성을 낮출 수 있도록 트랜잭션 구조를 개선하시오.**
+
+**답변**
+
+- [https://app.notion.com/p/leeeden/8-7-Lock-3ba70b7b39f48052abd9e40c36bacb42?source=copy_link](https://app.notion.com/p/leeeden/8-7-Lock-3ba70b7b39f48052abd9e40c36bacb42?source=copy_link)
+</details>
+</dd>
+</dl>
+</details>
+
+<details>
+  <summary>이시향🙋🏻‍♀️</summary>
+  
+  - [x] 주제 핵심 및 문제풀이 전략
+  - 추가 예정
+  - [x] 주제에 대한 서술형 문제 및 풀이 공유
+
+<dl>
+<dd>
+<details>
+  <summary>Lock과 트랜잭션 동시성 제어</summary>
+  
+  문제
+
+**답변**
+
+- 추가 예정
+</details>
+</dd>
+</dl>
+</details>
