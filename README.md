@@ -4877,7 +4877,7 @@ CREATE TABLE PRODUCT_STOCK
     CONSTRAINT PRODUCT_STOCK_PK PRIMARY KEY (PRODUCT_ID)
 );
 
-INSERT INTO PRODUCT_STOCK VALUES (1001, 10, 0);
+INSERT INTO PRODUCT_STOCK VALUES (1001, 1, 0);
 COMMIT;
 ```
 
@@ -5592,7 +5592,441 @@ ROW2 Lock 보유
 
 ---
 
-## 문제 3. 여기서부터 추가 예정
+## 문제 3. 서로 다른 데이터를 수정하는데 발생한 Blocking
+
+### 업무 상황
+
+온라인 주문 시스템에서 주문 상세 정보를 수정하는 업무가 특정 시간대에 대량으로 대기하는 장애가 발생하였다.
+
+테이블 구조는 다음과 같다.
+
+```sql
+CREATE TABLE ORDER_MST
+(
+    ORDER_ID      NUMBER       NOT NULL,
+    CUSTOMER_ID   NUMBER       NOT NULL,
+    ORDER_STATUS  VARCHAR2(2)  NOT NULL,
+    ORDER_DTM     DATE         NOT NULL,
+    CONSTRAINT ORDER_MST_PK PRIMARY KEY (ORDER_ID)
+);
+
+CREATE TABLE ORDER_DTL
+(
+    ORDER_DTL_ID  NUMBER       NOT NULL,
+    ORDER_ID      NUMBER       NOT NULL,
+    PRODUCT_ID    NUMBER       NOT NULL,
+    QTY           NUMBER       NOT NULL,
+    STATUS_CD     VARCHAR2(2)  NOT NULL,
+    MOD_DTM       DATE         NOT NULL,
+
+    CONSTRAINT ORDER_DTL_PK PRIMARY KEY (ORDER_DTL_ID),
+    CONSTRAINT ORDER_DTL_FK01
+        FOREIGN KEY (ORDER_ID)
+        REFERENCES ORDER_MST (ORDER_ID)
+);
+```
+
+데이터 및 인덱스 현황은 다음과 같다.
+
+```text
+ORDER_MST : 3,000만 건
+ORDER_DTL : 2억 건
+
+ORDER_MST_PK  : ORDER_ID
+ORDER_DTL_PK  : ORDER_DTL_ID
+ORDER_DTL_X01 : PRODUCT_ID
+ORDER_DTL_X02 : STATUS_CD, MOD_DTM
+```
+
+`ORDER_DTL.ORDER_ID`를 선두 컬럼으로 하는 인덱스는 존재하지 않는다.
+
+장애 발생 시점에 다음 세션들이 수행 중이었다.
+
+### Session 101
+
+```sql
+DELETE FROM ORDER_MST
+WHERE ORDER_ID = 10001;
+```
+
+해당 주문에는 `ORDER_DTL` 데이터가 존재하지 않는다.
+
+그러나 SQL은 수 분 동안 완료되지 않고 있다.
+
+### Session 202
+
+```sql
+UPDATE ORDER_DTL
+SET QTY = QTY + 1,
+    MOD_DTM = SYSDATE
+WHERE ORDER_DTL_ID = 90000001;
+```
+
+`ORDER_DTL_ID = 90000001`의 `ORDER_ID`는 `88000000`으로, Session 101이 삭제하는 `ORDER_ID = 10001`과 아무런 관련이 없다.
+
+그럼에도 Session 202는 대기 상태가 되었다.
+
+### Session 303
+
+```sql
+SELECT *
+FROM ORDER_DTL
+WHERE ORDER_DTL_ID = 90000002;
+```
+
+Session 303은 즉시 결과를 반환하였다.
+
+장애 당시 일부 동적 성능 뷰 조회 결과는 다음과 같다.
+
+```text
+V$SESSION
+
+SID   STATUS   EVENT                 BLOCKING_SESSION
+----  -------  --------------------  ----------------
+101   ACTIVE   db file scattered read
+202   ACTIVE   enq: TM - contention  101
+303   ACTIVE   SQL*Net message...    NULL
+```
+
+```text
+V$LOCK
+
+SID   TYPE   ID1       LMODE   REQUEST   BLOCK
+----  -----  --------  ------  --------  -----
+101   TM     87542     5       0         1
+202   TM     87542     0       3         0
+```
+
+`OBJECT_ID = 87542`는 `ORDER_DTL`이다.
+
+추가로 Session 101은 위 DELETE를 실행하기 전에 동일 트랜잭션에서 다른 테이블 약 250만 건을 변경하였으며 아직 COMMIT하지 않았다.
+
+```text
+V$TRANSACTION
+
+SID   USED_UBLK   USED_UREC
+----  ----------  ----------
+101   184320      2514821
+```
+
+### 요구사항
+
+1. Session 101과 Session 202는 동일한 행은 물론 동일한 `ORDER_ID`도 처리하지 않는다. 그럼에도 Session 202가 대기하는 원인을 `V$SESSION`, `V$LOCK`, 테이블 구조 및 인덱스 구성을 근거로 분석하시오.
+
+2. 위 장애를 일반적인 `TX Row Lock` 경합으로 판단하는 것이 적절한지 검토하고, `TX Lock`과 `TM Lock`의 차이를 현재 상황과 연결하여 설명하시오.
+
+3. `V$LOCK`의 `LMODE = 5`, `REQUEST = 3` 정보를 이용해 현재 두 세션 사이에서 발생한 Lock 경합을 설명하시오.
+
+4. Session 202의 UPDATE는 대기하지만 Session 303의 일반 SELECT는 정상적으로 수행되는 이유를 설명하시오.
+
+5. 다음 SQL이 Session 303 대신 수행되었다면 일반 SELECT와 동일하게 처리되는지 판단하시오.
+
+```sql
+SELECT *
+FROM ORDER_DTL
+WHERE ORDER_DTL_ID = 90000002
+FOR UPDATE;
+```
+
+6. 현재 장애의 근본 원인을 제거하기 위한 **물리적 설계 변경안**을 제시하고, 해당 변경으로 Lock 동작이 어떻게 달라질지 설명하시오.
+
+7. DBA가 장애를 즉시 해소하기 위해 다음 명령을 수행하려 한다.
+
+```sql
+ALTER SYSTEM KILL SESSION '101,<SERIAL#>' IMMEDIATE;
+```
+
+`V$TRANSACTION`의 정보를 고려하여 이 조치의 효과와 부작용을 분석하고, 단순히 “Blocking Session이므로 Kill한다”는 판단이 위험할 수 있는 이유를 설명하시오.
+
+8. Session 101을 Kill하는 방안과 Session 202를 업무적으로 재시도하도록 처리하는 방안을 비교하고, 장애 시점에서 어떤 정보를 추가로 확인한 후 의사결정해야 하는지 제시하시오.
+
+9. 개발자는 다음과 같이 주장하였다.
+
+```text
+ORDER_ID = 10001에는 ORDER_DTL 데이터가 없으므로
+ORDER_DTL과는 관련 없는 DELETE이다.
+따라서 ORDER_DTL에 인덱스를 추가하는 것은 의미가 없다.
+```
+
+해당 주장의 타당성을 판단하시오.
+
+10. 다음 두 변경안을 각각 검토하시오.
+
+```text
+안 1. ORDER_DTL.ORDER_ID에 인덱스를 생성한다.
+
+안 2. FK를 제거하고 애플리케이션에서 참조 무결성을 검사한다.
+```
+
+성능, 동시성, 데이터 무결성 측면에서 두 방안을 비교하시오.
+
+---
+
+## 문제 4. 작업자는 30개인데 처리량은 1개인 배치 시스템
+
+### 업무 상황
+
+외부 기관으로 데이터를 전송하는 비동기 작업 시스템이 있다.
+
+`SEND_QUEUE`에는 아직 처리되지 않은 작업이 계속 적재된다.
+
+```sql
+CREATE TABLE SEND_QUEUE
+(
+    JOB_ID        NUMBER        NOT NULL,
+    STATUS_CD     VARCHAR2(1)   NOT NULL,
+    PRIORITY      NUMBER        NOT NULL,
+    REG_DTM       DATE          NOT NULL,
+    WORKER_ID     VARCHAR2(30),
+    START_DTM     DATE,
+    END_DTM       DATE,
+
+    CONSTRAINT SEND_QUEUE_PK PRIMARY KEY (JOB_ID)
+);
+
+CREATE INDEX SEND_QUEUE_X01
+ON SEND_QUEUE (STATUS_CD, PRIORITY, REG_DTM);
+```
+
+`STATUS_CD`는 다음과 같다.
+
+```text
+R : 처리대기
+P : 처리중
+C : 처리완료
+E : 오류
+```
+
+동일한 프로그램을 실행하는 Worker 프로세스가 30개 존재한다.
+
+각 Worker는 다음 순서로 작업한다.
+
+```text
+1. STATUS_CD = 'R'인 작업 중 우선순위가 가장 높은 1건 조회
+2. 해당 행 SELECT FOR UPDATE
+3. 외부 API 호출
+4. STATUS_CD = 'C'로 UPDATE
+5. COMMIT
+```
+
+외부 API의 평균 응답시간은 8초이다.
+
+처리대기 상태인 데이터는 항상 10,000건 이상 존재하지만 실제 모니터링 결과는 다음과 같다.
+
+```text
+Worker 01 : JOB_ID 50001 처리 중
+
+Worker 02 : enq: TX - row lock contention
+Worker 03 : enq: TX - row lock contention
+Worker 04 : enq: TX - row lock contention
+...
+Worker 30 : enq: TX - row lock contention
+```
+
+대부분의 Worker가 동일한 `JOB_ID = 50001`을 기다리고 있었다.
+
+DB 서버의 CPU와 I/O 사용률은 낮으며 추가 Worker를 60개로 늘려도 전체 처리량은 거의 증가하지 않았다.
+
+### 요구사항
+
+1. 처리 가능한 작업이 10,000건 이상 존재하는데도 30개의 Worker가 사실상 직렬로 동작하는 원인을 분석하시오.
+
+2. Worker 수를 30개에서 60개로 늘렸음에도 처리량이 증가하지 않은 이유를 설명하고, 이 상황에서 병렬도를 증가시키는 것이 오히려 유발할 수 있는 문제를 제시하시오.
+
+3. 개발자가 다음과 같이 수정하려 한다.
+
+```sql
+SELECT ...
+FOR UPDATE NOWAIT;
+```
+
+`NOWAIT` 적용 시 현재와 비교하여 어떤 동작 변화가 발생하는지 설명하고, 이것만으로 작업이 여러 Worker에 고르게 분배되는지 판단하시오.
+
+4. 또 다른 개발자는 `SKIP LOCKED` 사용을 제안하였다.
+
+`NOWAIT`과 `SKIP LOCKED`의 처리 방식 차이를 설명하고, 현재와 같은 다중 Worker Queue 처리에서 어느 방식이 더 적절한지 논하시오.
+
+5. 다음 두 트랜잭션 구조를 비교하시오.
+
+### 방식 A
+
+```text
+작업 행 Lock
+→ 외부 API 호출
+→ 결과 UPDATE
+→ COMMIT
+```
+
+### 방식 B
+
+```text
+작업 행 Lock
+→ STATUS_CD = 'P' 변경
+→ COMMIT
+
+→ 외부 API 호출
+
+→ STATUS_CD = 'C' 변경
+→ COMMIT
+```
+
+Lock 유지시간과 동시성 측면에서 더 유리한 방식을 판단하시오.
+
+6. 단, 방식 B를 적용한 후 Worker 프로세스가 다음 시점에 비정상 종료되었다.
+
+```text
+STATUS_CD = 'P'
+COMMIT 완료
+        ↓
+외부 API 호출 직전
+        ↓
+Worker 비정상 종료
+```
+
+이 경우 발생하는 새로운 업무 문제를 설명하고, 이를 해결하기 위한 Queue 설계 방안을 제시하시오.
+
+7. 다음 장애도 고려하시오.
+
+```text
+외부 API 요청 성공
+        ↓
+상대 기관에서 정상 처리
+        ↓
+Worker 장애
+        ↓
+SEND_QUEUE를 C로 변경하지 못함
+```
+
+장애 복구 프로그램이 해당 작업을 다시 수행할 경우 발생할 수 있는 문제를 설명하고, 트랜잭션 Lock만으로 해결할 수 있는 문제인지 판단하시오.
+
+8. 작업 처리의 동시성을 높이면서도 중복 전송과 작업 유실을 방지할 수 있도록 다음 항목을 포함한 전체 처리 구조를 설계하시오.
+
+```text
+- 작업 선점 방식
+- Lock 유지 범위
+- STATUS 전이
+- 장애 작업 재처리
+- 동일 작업의 중복 실행 방지
+```
+
+9. `SKIP LOCKED`를 사용하면 모든 동시성 문제가 해결된다는 주장에 대해 반박하시오.
+
+10. 본 시스템의 병목이 CPU, I/O, SQL 실행시간이 아닌 **트랜잭션 및 업무 직렬화 구조**라고 판단할 수 있는 근거를 제시하시오.
+
+---
+
+## 문제 5. Lock은 정상인데 잔액이 틀렸다
+
+### 업무 상황
+
+포인트 시스템에서 사용자 포인트 차감 기능을 다음과 같이 구현하였다.
+
+```text
+① 현재 포인트 SELECT
+② 애플리케이션에서 차감 후 잔액 계산
+③ 계산된 값을 UPDATE
+④ COMMIT
+```
+
+현재 데이터는 다음과 같다.
+
+```text
+USER_ID = 100
+POINT   = 10,000
+```
+
+거의 동시에 두 요청이 발생하였다.
+
+```text
+Transaction A : 3,000 포인트 사용
+Transaction B : 4,000 포인트 사용
+```
+
+실제 수행 순서는 다음과 같다.
+
+```text
+T1  A : POINT 조회 → 10,000
+
+T2  B : POINT 조회 → 10,000
+
+T3  A : 애플리케이션에서 7,000 계산
+
+T4  B : 애플리케이션에서 6,000 계산
+
+T5  A : UPDATE POINT = 7,000
+
+T6  B : UPDATE POINT = 6,000
+        → A가 COMMIT하지 않았으므로 대기
+
+T7  A : COMMIT
+
+T8  B : UPDATE 수행
+
+T9  B : COMMIT
+```
+
+모든 SQL은 오류 없이 종료되었으며 장시간 Blocking이나 Deadlock도 발생하지 않았다.
+
+최종 포인트는 `6,000`이 되었다.
+
+### 요구사항
+
+1. 두 트랜잭션에서 모두 Row Lock이 정상적으로 동작하였음에도 최종 데이터가 업무적으로 잘못된 이유를 설명하시오.
+
+2. Lock이 데이터 변경의 충돌을 막는 것과 **애플리케이션이 읽은 값의 유효성을 보장하는 것**이 어떻게 다른지 설명하시오.
+
+3. 현재 문제를 해결하기 위해 다음 SQL로 변경하려 한다.
+
+```sql
+UPDATE USER_POINT
+SET POINT = POINT - :USE_POINT
+WHERE USER_ID = :USER_ID;
+```
+
+기존 방식과 비교하여 동시 요청 시 처리 결과가 어떻게 달라지는지 분석하시오.
+
+4. 잔액 부족을 함께 검증하기 위해 다음과 같이 변경하였다.
+
+```sql
+UPDATE USER_POINT
+SET POINT = POINT - :USE_POINT
+WHERE USER_ID = :USER_ID
+  AND POINT >= :USE_POINT;
+```
+
+위 SQL을 사용할 경우 애플리케이션이 반드시 추가로 확인해야 하는 정보를 제시하시오.
+
+5. 다음과 같이 Version 컬럼을 사용하는 방안도 제시되었다.
+
+```sql
+UPDATE USER_POINT
+SET POINT   = :NEW_POINT,
+    VERSION = VERSION + 1
+WHERE USER_ID = :USER_ID
+  AND VERSION = :OLD_VERSION;
+```
+
+이 방식이 기존 처리와 어떤 차이를 가지는지 설명하시오.
+
+6. `SELECT ... FOR UPDATE`를 이용하여 최초 조회 단계부터 행을 잠그는 방안과 Version 컬럼을 사용하는 방안을 비교하시오.
+
+7. 다음 요구조건에서는 어느 동시성 제어 방식이 더 적절한지 각각 판단하시오.
+
+```text
+① 충돌 가능성이 매우 낮음
+② 충돌 가능성이 매우 높음
+③ 트랜잭션 내부에 사용자 입력 대기가 존재함
+④ 반드시 현재 값을 읽고 복잡한 업무 계산 후 갱신해야 함
+```
+
+8. 개발자는 다음과 같이 주장하였다.
+
+```text
+어차피 UPDATE 시 Row Lock을 획득하므로
+동시성 문제는 DBMS가 알아서 해결한다.
+```
+
+해당 주장의 문제점을 현재 사례를 이용하여 설명하시오.
 
 **답변**
 
