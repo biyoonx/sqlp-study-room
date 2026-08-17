@@ -5320,7 +5320,279 @@ ORA-00060: deadlock detected while waiting for resource
 <details>
   <summary>Lock과 트랜잭션 동시성 제어</summary>
   
-  문제
+  ### 문제 1. 장시간 Blocking과 세션 강제 종료
+
+#### 1. 업무 상황
+
+주문관리 시스템에서 특정 주문의 상태를 변경하는 업무가 간헐적으로 장시간 대기하는 현상이 발생하고 있다.
+
+`ORDER_TXN` 테이블은 다음과 같다.
+
+```sql
+CREATE TABLE ORDER_TXN
+(
+    ORDER_NO       NUMBER        NOT NULL,
+    CUSTOMER_ID    NUMBER        NOT NULL,
+    ORDER_STATUS   VARCHAR2(2)   NOT NULL,
+    ORDER_AMT      NUMBER        NOT NULL,
+    MOD_DTM        DATE          NOT NULL,
+    CONSTRAINT ORDER_TXN_PK PRIMARY KEY (ORDER_NO)
+);
+```
+
+장애 발생 당시 두 세션에서는 다음 작업이 수행되고 있었다.
+
+#### Session A
+
+```sql
+UPDATE ORDER_TXN
+SET ORDER_STATUS = '20',
+    MOD_DTM      = SYSDATE
+WHERE ORDER_NO = 10001;
+```
+
+위 UPDATE는 정상적으로 수행되었다.
+
+그러나 이후 애플리케이션에서 외부 시스템을 호출한 뒤 응답을 기다리면서 약 10분 동안 `COMMIT` 또는 `ROLLBACK`이 수행되지 않았다.
+
+#### Session B
+
+Session A의 UPDATE 수행 약 1분 후 다음 SQL이 실행되었다.
+
+```sql
+UPDATE ORDER_TXN
+SET ORDER_STATUS = '30',
+    MOD_DTM      = SYSDATE
+WHERE ORDER_NO = 10001;
+```
+
+Session B의 SQL은 9분 이상 완료되지 않고 대기 상태가 되었다.
+
+확인 결과 Session A가 Session B의 처리를 방해하고 있었다.
+
+운영자는 Session A를 다음과 같이 강제 종료하였다.
+
+```sql
+ALTER SYSTEM KILL SESSION '152,38172' IMMEDIATE;
+```
+
+그러나 명령 수행 직후에도 Session B의 대기가 일정 시간 계속되었다.
+
+추가 조사 결과 Session A는 해당 주문을 변경하기 전에 동일 트랜잭션에서 약 300만 건의 데이터를 변경하였으며, 해당 변경 내용 또한 아직 COMMIT되지 않은 상태였다.
+
+#### 요구사항
+
+1. Session A의 UPDATE SQL 자체는 이미 완료되었음에도 Session B가 대기하게 된 원인을 Lock과 트랜잭션 관점에서 설명하시오.
+
+2. 위 상황에서 Blocking Session과 Waiting Session을 각각 식별하고, 각 세션의 상태를 설명하시오.
+
+3. Session A가 `ORDER_NO = 10001` 행에 대해 UPDATE가 아닌 다음 일반 SELECT만 수행하고 있었다면 Session B의 UPDATE가 동일하게 대기하는지 설명하시오.
+
+```sql
+SELECT *
+FROM ORDER_TXN
+WHERE ORDER_NO = 10001;
+```
+
+4. Session A를 `KILL SESSION`으로 강제 종료할 경우 Session A가 수행한 미완료 트랜잭션과 보유 중인 Lock에 어떠한 처리가 발생하는지 설명하시오.
+
+5. `KILL SESSION ... IMMEDIATE` 명령을 수행했음에도 Session B의 대기가 즉시 해소되지 않은 이유를 설명하시오.
+
+6. 다음 장애 대응 방안의 문제점을 설명하시오.
+
+```text
+Blocking이 발생하면 Blocking Session을 즉시 Kill한다.
+```
+
+또한 실제 운영 환경에서 Blocking Session을 종료하기 전에 확인해야 할 사항을 제시하시오.
+
+7. 현재 애플리케이션의 처리 구조는 다음과 같다.
+
+```text
+트랜잭션 시작
+    ↓
+DB 데이터 변경
+    ↓
+외부 API 호출
+    ↓
+외부 시스템 응답 대기
+    ↓
+추가 DB 처리
+    ↓
+COMMIT
+```
+
+위 구조가 Lock 경합을 증가시킬 수 있는 이유를 설명하고, 트랜잭션 범위 측면에서 개선 방향을 제시하시오.
+
+8. 해당 장애가 반복적으로 발생하고 있다고 가정한다. 단순한 Session Kill에 의존하지 않고 장애 발생 가능성을 줄이기 위한 애플리케이션 및 트랜잭션 설계 측면의 개선 방안을 제시하시오.
+
+---
+
+## 문제 2. Deadlock과 트랜잭션 처리 순서
+
+### 1. 업무 상황
+
+계좌이체 시스템에서는 하나의 이체 업무를 처리하기 위해 출금 계좌와 입금 계좌의 잔액을 하나의 트랜잭션에서 변경한다.
+
+`ACCOUNT` 테이블은 다음과 같다.
+
+```sql
+CREATE TABLE ACCOUNT
+(
+    ACCOUNT_NO     VARCHAR2(20) NOT NULL,
+    BALANCE        NUMBER       NOT NULL,
+    MOD_DTM        DATE         NOT NULL,
+    CONSTRAINT ACCOUNT_PK PRIMARY KEY (ACCOUNT_NO)
+);
+```
+
+두 사용자가 거의 동시에 서로 반대 방향의 계좌이체를 요청하였다.
+
+#### Session A
+
+`A001` 계좌에서 `A002` 계좌로 10,000원을 이체한다.
+
+```sql
+UPDATE ACCOUNT
+SET BALANCE = BALANCE - 10000,
+    MOD_DTM  = SYSDATE
+WHERE ACCOUNT_NO = 'A001';
+
+/* 일부 업무 처리 */
+
+UPDATE ACCOUNT
+SET BALANCE = BALANCE + 10000,
+    MOD_DTM  = SYSDATE
+WHERE ACCOUNT_NO = 'A002';
+
+COMMIT;
+```
+
+#### Session B
+
+`A002` 계좌에서 `A001` 계좌로 20,000원을 이체한다.
+
+```sql
+UPDATE ACCOUNT
+SET BALANCE = BALANCE - 20000,
+    MOD_DTM  = SYSDATE
+WHERE ACCOUNT_NO = 'A002';
+
+/* 일부 업무 처리 */
+
+UPDATE ACCOUNT
+SET BALANCE = BALANCE + 20000,
+    MOD_DTM  = SYSDATE
+WHERE ACCOUNT_NO = 'A001';
+
+COMMIT;
+```
+
+실제 수행 순서는 다음과 같다.
+
+```text
+시간     Session A                         Session B
+
+T1       A001 UPDATE 완료
+
+T2                                         A002 UPDATE 완료
+
+T3       A002 UPDATE 시도
+         → 대기
+
+T4                                         A001 UPDATE 시도
+                                           → ?
+```
+
+#### 요구사항
+
+1. T3 시점에서 Session A의 두 번째 UPDATE가 대기하게 되는 이유를 설명하시오.
+
+2. T4 시점에서 발생하는 상황을 Lock 획득 관계를 이용하여 설명하시오.
+
+3. 문제 1의 Blocking 상황과 현재 상황의 차이를 설명하고, 현재 발생한 현상을 적절한 용어로 정의하시오.
+
+4. DBMS가 위 상태를 두 세션 모두 계속 대기하도록 방치할 수 없는 이유를 설명하고, Deadlock이 감지되었을 때 트랜잭션 처리 측면에서 어떠한 조치가 필요한지 설명하시오.
+
+5. 개발자가 다음과 같이 프로그램을 변경하면 문제가 해결될 것이라고 주장하였다.
+
+```text
+각 UPDATE 직후 COMMIT한다.
+```
+
+예를 들어 Session A를 다음과 같이 변경한다.
+
+```sql
+UPDATE ACCOUNT
+SET BALANCE = BALANCE - 10000
+WHERE ACCOUNT_NO = 'A001';
+
+COMMIT;
+
+UPDATE ACCOUNT
+SET BALANCE = BALANCE + 10000
+WHERE ACCOUNT_NO = 'A002';
+
+COMMIT;
+```
+
+위 방식이 Lock 유지시간에 미치는 영향과 별개로, 계좌이체라는 업무의 트랜잭션 원자성 관점에서 적절한지 판단하고 그 이유를 설명하시오.
+
+6. 다음과 같이 프로그램의 Lock 획득 순서를 변경하려 한다.
+
+```text
+출금 계좌와 입금 계좌의 방향과 관계없이
+항상 ACCOUNT_NO가 작은 계좌부터 변경한다.
+```
+
+따라서 `A002 → A001` 이체 역시 다음 순서로 처리한다.
+
+```text
+A001
+  ↓
+A002
+```
+
+위 변경이 Deadlock 발생 가능성에 어떠한 영향을 주는지 설명하시오.
+
+7. 다음 두 상황을 비교하시오.
+
+#### 상황 A
+
+```text
+Transaction A
+ROW1 변경 후 미커밋
+
+Transaction B
+ROW1 변경 시도
+→ Transaction A 종료 대기
+```
+
+#### 상황 B
+
+```text
+Transaction A
+ROW1 Lock 보유
+→ ROW2 Lock 대기
+
+Transaction B
+ROW2 Lock 보유
+→ ROW1 Lock 대기
+```
+
+각 상황을 Blocking과 Deadlock 관점에서 구분하고, 두 문제의 해결 방식이 다른 이유를 설명하시오.
+
+8. 계좌이체 프로그램에서 Deadlock과 장시간 Blocking 발생 가능성을 줄이기 위해 다음 세 가지 측면에서 개선 방향을 제시하시오.
+
+```text
+① 트랜잭션 범위
+② Lock 획득 순서
+③ COMMIT / ROLLBACK 위치
+```
+
+---
+
+## 문제 3. 여기서부터 추가 예정
 
 **답변**
 
