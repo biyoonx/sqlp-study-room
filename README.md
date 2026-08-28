@@ -5097,6 +5097,7 @@ COMMIT;
 ---
 
 문제2 출처 : [SQLP 54회 1번 복기](https://cafe.naver.com/dbstudydapsqlp/10550)
+
 문제3 출처 : [SQLP 54회 2번 복기](https://cafe.naver.com/dbstudydapsqlp/10551)
 
 **답변**
@@ -5312,7 +5313,7 @@ ORA-00060: deadlock detected while waiting for resource
   <summary>이시향🙋🏻‍♀️</summary>
   
   - [x] 주제 핵심 및 문제풀이 전략
-  - 추가 예정
+  - [[SQLP 스터디] 8주차 - 제7장 Lock과 트랜잭션 동시성 제어 : Ⅰ-Ⅸ](https://blog.naver.com/biyoonx/224393755494)
   - [x] 주제에 대한 서술형 문제 및 풀이 공유
 
 <dl>
@@ -6030,7 +6031,7 @@ WHERE USER_ID = :USER_ID
 
 **답변**
 
-- 추가 예정
+- [[SQLP 스터디] 8주차 - 제7장 Lock과 트랜잭션 동시성 제어 : Ⅹ.문제풀이](https://blog.naver.com/biyoonx/224393755494)
 </details>
 </dd>
 </dl>
